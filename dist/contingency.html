@@ -1853,10 +1853,20 @@ canvas.chart { width: 100%; height: 160px; display: block; }
   // ---------- Helpers ----------
   F.founder = (state) => state.staff.find((s) => s.isFounder);
   // Online reviews. Until a firm has a few, callers assume about four stars.
-  F.stars = function (state) { const r = state.reviews || { sum: 0, n: 0 }; return r.n >= 3 ? r.sum / r.n : 4.0; };
-  F.addReview = function (state, stars, who, why) { state.reviews = state.reviews || { sum: 0, n: 0, recent: [] }; state.reviews.sum += stars; state.reviews.n++; state.reviews.recent.unshift({ day: state.day, stars, who, why }); if (state.reviews.recent.length > 10) state.reviews.recent.pop(); };
+  // Recent reviews count for more: a one-star review is half as loud after a year. A reformed firm can climb back; it just takes time.
+  F.stars = function (state) {
+    const r = state.reviews || { sum: 0, n: 0, recent: [] };
+    if (r.n < 3) return 4.0;
+    let ws = 0, wt = 0;
+    for (const rv of r.recent || []) { const w = Math.pow(0.5, (state.day - rv.day) / 365); ws += w * rv.stars; wt += w; }
+    // Reviews older than the stored window are a faded background average.
+    const olderN = r.n - (r.recent || []).length;
+    if (olderN > 0) { const olderAvg = (r.sum - (r.recent || []).reduce((a, x) => a + x.stars, 0)) / olderN; const w = Math.min(olderN, 10) * 0.15; ws += w * olderAvg; wt += w; }
+    return wt ? ws / wt : 4.0;
+  };
+  F.addReview = function (state, stars, who, why) { state.reviews = state.reviews || { sum: 0, n: 0, recent: [] }; state.reviews.sum += stars; state.reviews.n++; state.reviews.recent.unshift({ day: state.day, stars, who, why }); if (state.reviews.recent.length > 60) state.reviews.recent.pop(); };
   // How much of every marketing dollar actually turns into a phone call, given the reviews.
-  F.marketingEffect = function (state) { return PI.clamp(0.15 + 0.85 * ((F.stars(state) - 1) / 3), 0.15, 1.15); };
+  F.marketingEffect = function (state) { return PI.clamp(0.04 + 1.11 * Math.pow(PI.clamp((F.stars(state) - 1) / 3, 0, 1.33), 1.6), 0.04, 1.2); };
   // Each carrier keeps a file on the firm.
   F.carrier = function (state, id) { state.carriers = state.carriers || {}; return state.carriers[id] || (state.carriers[id] = { credibility: 0, cases: 0, paid: 0, filed: 0, notes: [] }); };
   F.carrierNote = function (state, id, delta, why) { const k = F.carrier(state, id); k.credibility = PI.clamp(k.credibility + delta, -10, 10); k.notes.unshift({ day: state.day, delta, why }); if (k.notes.length > 8) k.notes.pop(); };
@@ -1898,9 +1908,28 @@ canvas.chart { width: 100%; height: 160px; display: block; }
   };
   F.barComplaint = function (state, text) {
     state.stats.barComplaints++;
+    state.barHeat = (state.barHeat || 0) + 1;
     F.log(state, `Bar complaint: ${text}`, 'bad');
     F.adjustRep(state, -1);
-    if (state.stats.barComplaints >= 3 && R.chance(0.3)) F.queueEvent(state, 'bar_hearing');
+  };
+  // The state bar notices patterns. Heat decays by about two and a half complaints a year.
+  F.barLevel = function (state) { const h = state.barHeat || 0; return h < 3 ? ['Clean', ''] : h < 6 ? ['A few complaints on file', 'warn'] : h < 10 ? ['Under investigation', 'danger'] : ['Disbarment proceedings looming', 'danger']; };
+  F.weeklyBar = function (state) {
+    state.barHeat = Math.max(0, (state.barHeat || 0) - 0.05);
+    const h = state.barHeat;
+    const f = F.founder(state);
+    if (h >= 16) { state.gameOver = { kind: 'disbarred', text: `The state bar disbarred ${f.name} after a pattern of client neglect, missed deadlines and solicitation complaints. Without a licensed managing partner, ${state.firmName} was wound up and its files referred out. Legacy score: ${F.legacy(state).toLocaleString()}.` }; F.log(state, `${f.name} has been disbarred.`, 'bad'); return; }
+    if (h >= 10 && (!state.lastSuspensionWeek || state.week - state.lastSuspensionWeek > 52)) {
+      state.lastSuspensionWeek = state.week;
+      f.suspendedUntil = state.day + 180;
+      state.barHeat -= 2;
+      F.addReview(state, 1, 'Local news', 'managing partner suspended by the state bar');
+      F.adjustRep(state, -10);
+      F.news(state, `State bar suspends ${f.name} of ${state.firmName} for six months over client neglect.`);
+      F.log(state, `The state bar suspended ${f.name} for 180 days. The pattern of complaints is now public. Next time it will be disbarment.`, 'bad');
+      return;
+    }
+    if (h >= 5 && (!state.lastHearingWeek || state.week - state.lastHearingWeek > 26) && !state.events.find((e) => e.id === 'bar_hearing')) { state.lastHearingWeek = state.week; F.queueEvent(state, 'bar_hearing'); }
   };
   F.achieve = function (state, id, text) { if (state.achievements.find((a) => a.id === id)) return; state.achievements.push({ id, text, day: state.day }); F.log(state, `Milestone: ${text}`, 'stage'); };
 
@@ -1969,6 +1998,10 @@ canvas.chart { width: 100%; height: 160px; display: block; }
 
     // Staff.
     F.weeklyStaff(state);
+
+    // The bar.
+    F.weeklyBar(state);
+    if (state.gameOver) { F.snapshot(state); return; }
 
     // Events.
     F.rollEvents(state);
@@ -2209,6 +2242,9 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       // Morale baseline drift.
       const officeBonus = D.OFFICES[state.office].rep * 0.03;
       st.morale += officeBonus - 0.2;
+      const stars = F.stars(state);
+      if (stars < 3) st.morale -= (3 - stars) * 0.5; // nobody wants a mill with bad reviews on their resume
+      else if (stars > 4.3) st.morale += 0.15;
       if (state.staff.length > F.officeCap(state)) st.morale -= 1.5;
       if (st.lastRaiseDay && state.day - st.lastRaiseDay > 365 * 1.5) st.morale -= 0.3;
       st.morale = PI.clamp(st.morale, 0, 100);
@@ -2417,7 +2453,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     recession: { title: 'Recession', w: 2, cond: (s) => s.week > 40 && !s.modifiers.recessionUntil, text: 'Markets fell 20% and carriers are tightening reserves. Expect lower offers for a year.', options: [{ label: 'Acknowledge', desc: 'Offers down 10% for 12 months.' }] },
     founder_health: { title: 'Health scare', w: 2, cond: (s) => F.founder(s).age >= 52, text: 'Chest pains during a deposition. The cardiologist says stress. Six weeks of reduced hours.', options: [{ label: 'Follow doctor\'s orders', desc: 'Founder capacity reduced for six weeks.' }] },
     cle_invite: { title: 'Invited to speak at a CLE', w: 4, cond: (s) => s.stats.resolved >= 8, text: 'The county bar wants a one-hour talk on time-limited demands. Every lawyer in the room is a potential referral source.', options: [{ label: 'Give the talk', desc: 'Attorney referral network grows by one level.' }, { label: 'Decline', desc: '' }] },
-    bar_hearing: { title: 'Disciplinary hearing', w: 0, cond: () => false, text: 'Three bar complaints in a short span triggered a formal hearing. The panel is considering a suspension.', options: [{ label: 'Retain ethics counsel ($20,000)', desc: '80% chance of a private reprimand only.' }, { label: 'Represent yourself', desc: '50% chance of a 90-day suspension.' }] },
+    bar_hearing: { title: 'Disciplinary hearing', w: 0, cond: () => false, text: 'A run of bar complaints in a short span triggered a formal hearing. The panel is considering a suspension. Whatever happens here, the complaints keep counting until the firm changes how it treats clients.', options: [{ label: 'Retain ethics counsel ($20,000)', desc: '80% chance of a private reprimand only.' }, { label: 'Represent yourself', desc: '50% chance of a 90-day suspension.' }] },
     runner_caught: { title: 'Solicitation investigation', w: 0, cond: () => false, text: 'Your runner was arrested. He named every lawyer he worked with.', options: [{ label: 'Cooperate', desc: 'Suspension for 90 days, reputation hit.' }] },
     defense_verdict_press: { title: 'Carrier publicity', w: 2, cond: (s) => s.stats.trialLosses >= 1, text: 'A carrier\'s defense firm is bragging about beating you at trial in its newsletter.', options: [{ label: 'Respond with your verdict record', desc: 'Reputation +1 if you have trial wins; otherwise nothing.' }, { label: 'Ignore it', desc: '' }] },
     paralegal_catch: { title: 'Calendar catch', w: 3, cond: (s) => (s.staffCounts.paralegal || 0) >= 1, text: 'Your paralegal noticed a statute of limitations that was calendared on the wrong year. Caught with three weeks to spare.', options: [{ label: 'Buy lunch for the whole office ($300)', desc: 'Morale up across the firm.' }] }
@@ -2472,8 +2508,8 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       case 'recession:0': state.modifiers.recessionUntil = state.day + 365; break;
       case 'founder_health:0': F.founder(state).sickUntil = state.day + 42; break;
       case 'cle_invite:0': state.marketing.network = Math.min(D.CHANNELS.network.maxLevel, (state.marketing.network || 0) + 1); if (!state.channelSince.network) state.channelSince.network = state.week; say('Forty lawyers took your card.', 'good'); break;
-      case 'bar_hearing:0': F.spend(state, 20000, 'Ethics counsel', 'overhead'); if (R.chance(0.8)) say('Private reprimand. The matter is closed.', 'good'); else suspend(state, 90); break;
-      case 'bar_hearing:1': if (R.chance(0.5)) say('Public reprimand, no suspension.', 'warn'); else suspend(state, 90); break;
+      case 'bar_hearing:0': F.spend(state, 20000, 'Ethics counsel', 'overhead'); state.barHeat = Math.max(0, (state.barHeat || 0) - 1.5); if (R.chance(0.8)) say('Private reprimand. The matter is closed, for now.', 'good'); else suspend(state, 90); break;
+      case 'bar_hearing:1': state.barHeat = Math.max(0, (state.barHeat || 0) - 0.5); if (R.chance(0.5)) say('Public reprimand, no suspension.', 'warn'); else suspend(state, 90); break;
       case 'runner_caught:0': suspend(state, 90); F.adjustRep(state, -10); state.modifiers.leadMultUntil = 0; break;
       case 'defense_verdict_press:0': if (state.stats.trialWins) F.adjustRep(state, 1); break;
       case 'paralegal_catch:0': F.spend(state, 300, 'Office lunch', 'overhead'); for (const s of state.staff) s.morale = Math.min(100, s.morale + 6); break;
@@ -2568,6 +2604,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     for (const a of F.attorneys(s)) { const ld = s.loads && s.loads[a.id]; if (ld && ld.speed < 0.7) items.push({ kind: 'load', text: `${a.name} is overloaded (${Math.round(ld.need)} work units against a capacity of ${Math.round(ld.cap)}). Files are moving at ${Math.round(ld.speed * 100)}% speed.`, act: 'tab', arg: 'staff', level: 'warn' }); }
     const expiring = s.leads.filter((l) => l.expiresDay - s.day <= 3).length;
     if (expiring) items.push({ kind: 'leads', text: `${expiring} lead${expiring > 1 ? 's' : ''} will call another firm within days`, act: 'tab', arg: 'intake', level: 'warn' });
+    if ((s.barHeat || 0) >= 5) items.push({ kind: 'bar', text: `The state bar is watching: ${F.barLevel(s)[0].toLowerCase()}. Complaints come from neglected clients, blown deadlines and fast settlements that went wrong.`, act: 'tab', arg: 'firm', level: 'danger' });
     if (s.cash < 0) items.push({ kind: 'cash', text: `Cash is negative. ${s.debt < s.creditLimit ? 'The line of credit is covering payroll.' : 'The line of credit is maxed out.'}`, act: 'tab', arg: 'finance', level: 'danger' });
     if (s.staff.length >= F.officeCap(s)) items.push({ kind: 'office', text: 'The office is full. No room to hire.', act: 'tab', arg: 'office', level: 'info' });
     const f = F.founder(s);
@@ -2953,7 +2990,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
           <label class="row"><input type="checkbox" data-act="policy" data-arg="insured" ${s.policy.insured ? 'checked' : ''}> Carry malpractice insurance</label>
         </div><div class="actions" style="margin-top:10px">${btn('delegate-all', 'Delegate every open file', { cls: 'sm' })}${btn('handson-all', 'Take every file hands-on', { cls: 'sm' })}</div></div>
         <div class="panel"><h3>Record</h3><table>
-          <tr><td>Lifetime fees</td><td class="num">${M(s.stats.feesEarned)}</td></tr><tr><td>Recovered for clients</td><td class="num">${M(s.stats.recovered)}</td></tr><tr><td>Cases resolved</td><td class="num">${s.stats.resolved}</td></tr><tr><td>Settled pre-suit / in litigation</td><td class="num">${s.stats.settledPreSuit} / ${s.stats.settledLit}</td></tr><tr><td>Trials (won / lost)</td><td class="num">${s.stats.trialWins} / ${s.stats.trialLosses}</td></tr><tr><td>Largest verdict</td><td class="num">${M(s.stats.biggestVerdict)}</td></tr><tr><td>Largest settlement</td><td class="num">${M(s.stats.biggestSettlement)}</td></tr><tr><td>Clients who fired the firm</td><td class="num">${s.stats.clientsLost}</td></tr><tr><td>Malpractice claims / bar complaints</td><td class="num">${s.stats.malpractice} / ${s.stats.barComplaints}</td></tr></table></div>
+          <tr><td>Lifetime fees</td><td class="num">${M(s.stats.feesEarned)}</td></tr><tr><td>Recovered for clients</td><td class="num">${M(s.stats.recovered)}</td></tr><tr><td>Cases resolved</td><td class="num">${s.stats.resolved}</td></tr><tr><td>Settled pre-suit / in litigation</td><td class="num">${s.stats.settledPreSuit} / ${s.stats.settledLit}</td></tr><tr><td>Trials (won / lost)</td><td class="num">${s.stats.trialWins} / ${s.stats.trialLosses}</td></tr><tr><td>Largest verdict</td><td class="num">${M(s.stats.biggestVerdict)}</td></tr><tr><td>Largest settlement</td><td class="num">${M(s.stats.biggestSettlement)}</td></tr><tr><td>Clients who fired the firm</td><td class="num">${s.stats.clientsLost}</td></tr><tr><td>Malpractice claims / bar complaints</td><td class="num">${s.stats.malpractice} / ${s.stats.barComplaints}</td></tr><tr><td>Standing with the state bar</td><td class="num">${(() => { const b = F.barLevel(s); return chip(b[0], b[1]); })()}</td></tr></table></div>
       </div>
       <div class="grid cols-2">
         <div class="panel"><h3>Milestones</h3>${s.achievements.length ? `<div class="timeline">${s.achievements.slice().reverse().map((a) => `<div class="entry good"><span class="when">${h(date(a.day))}</span><span class="what">${h(a.text)}</span></div>`).join('')}</div>` : '<div class="empty">None yet.</div>'}</div>
@@ -3062,11 +3099,12 @@ canvas.chart { width: 100%; height: 160px; display: block; }
           <p><strong>Reviews run the marketing.</strong> Closed cases leave reviews. Callers read them before they dial, so a two-star firm gets a fraction of the calls per ad dollar that a four-star firm gets, and the good callers hang up sooner. Fast, cheap settlements and ignored clients write the one-star reviews.</p>
           <p><strong>Two reputations.</strong> Street reputation comes from satisfied clients, referrals, community and advertising; it brings leads. Carrier reputation comes from what you do with offers: fold early and every adjuster in town lowballs you; file suits and win verdicts and they reserve higher against your letterhead before you say a word.</p>
           <p><strong>Pick a kind of firm.</strong> A volume shop signs widely, settles early and lives on marketing and headcount. A boutique signs strong cases, works them up fully and lives on referrals and verdicts. Both can make money. The Firm tab sets how your delegated attorneys and intake staff behave; your own hands-on files can go either way.</p>
+          <p><strong>The bar is watching.</strong> Neglected clients, missed deadlines, kickbacks and fast settlements that went wrong all turn into bar complaints. A few are survivable. A pattern means hearings, then a suspension, then disbarment and the end of the firm. The Firm tab shows your standing.</p>
           <p><strong>The clock.</strong> Every claim has a statute of limitations. Suit must be on file before it runs or the case dies and the client sues you. Government claims need a notice of claim within months.</p>
         </div>
         <div class="actions">${btn('close-modal', 'Got it')}</div>`;
     } else if (m.type === 'gameover') {
-      html = `<h2>${s.gameOver.kind === 'bankrupt' ? 'The firm is insolvent' : 'The firm has dissolved'}</h2><p>${h(s.gameOver.text)}</p><table><tr><td>Years in practice</td><td class="num">${(s.week / 52).toFixed(1)}</td></tr><tr><td>Lifetime fees</td><td class="num">${M(s.stats.feesEarned)}</td></tr><tr><td>Recovered for clients</td><td class="num">${M(s.stats.recovered)}</td></tr><tr><td>Cases resolved</td><td class="num">${s.stats.resolved}</td></tr><tr><td>Highest tier</td><td>${h(D.TIERS[s.tier].name)}</td></tr></table><div class="actions">${btn('new-game', 'Start a new firm', { cls: 'primary' })}</div>`;
+      html = `<h2>${s.gameOver.kind === 'bankrupt' ? 'The firm is insolvent' : s.gameOver.kind === 'disbarred' ? 'Disbarred' : 'The firm has dissolved'}</h2><p>${h(s.gameOver.text)}</p><table><tr><td>Years in practice</td><td class="num">${(s.week / 52).toFixed(1)}</td></tr><tr><td>Lifetime fees</td><td class="num">${M(s.stats.feesEarned)}</td></tr><tr><td>Recovered for clients</td><td class="num">${M(s.stats.recovered)}</td></tr><tr><td>Cases resolved</td><td class="num">${s.stats.resolved}</td></tr><tr><td>Highest tier</td><td>${h(D.TIERS[s.tier].name)}</td></tr></table><div class="actions">${btn('new-game', 'Start a new firm', { cls: 'primary' })}</div>`;
     }
     root.innerHTML = `<div class="modal ${m.type === 'offer' || m.type === 'liens' ? 'wide' : ''}" role="dialog">${html}</div>`;
   };
