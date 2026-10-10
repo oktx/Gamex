@@ -30,7 +30,7 @@
     const bg = D.FOUNDER_BACKGROUNDS.find((b) => b.id === opts.backgroundId) || D.FOUNDER_BACKGROUNDS[0];
     const state = {
       version: F.SAVE_VERSION, seed: opts.seed, firmName: opts.firmName || 'Law Office of ' + opts.founderName, founderName: opts.founderName, city, cityId: city.id,
-      day: 0, week: 0, cash: bg.cash, debt: 0, creditLimit: 60000, reputation: 18, generation: 1, founderDraw: 3500,
+      day: 0, week: 0, cash: bg.cash, debt: 0, creditLimit: 60000, reputation: 18, carrierRep: 30, carriers: {}, strategy: { philosophy: 'balanced', selectivity: 'selective' }, generation: 1, founderDraw: 3500,
       office: 0, offices: [], staff: [], candidates: [], cases: [], leads: [], marketing: {}, channelSince: {},
       policy: { autoDelegate: true, autoAssign: true, insured: true, pauseOnDecision: true, autoIntake: false },
       stats: { feesEarned: 0, recovered: 0, resolved: 0, signed: 0, declined: 0, trials: 0, trialWins: 0, trialLosses: 0, biggestVerdict: 0, biggestSettlement: 0, settledPreSuit: 0, settledLit: 0, clientsLost: 0, malpractice: 0, barComplaints: 0, leadsLost: 0, leadsTotal: 0 },
@@ -83,6 +83,9 @@
 
   // ---------- Helpers ----------
   F.founder = (state) => state.staff.find((s) => s.isFounder);
+  // Each carrier keeps a file on the firm.
+  F.carrier = function (state, id) { state.carriers = state.carriers || {}; return state.carriers[id] || (state.carriers[id] = { credibility: 0, cases: 0, paid: 0, filed: 0, notes: [] }); };
+  F.carrierNote = function (state, id, delta, why) { const k = F.carrier(state, id); k.credibility = PI.clamp(k.credibility + delta, -10, 10); k.notes.unshift({ day: state.day, delta, why }); if (k.notes.length > 8) k.notes.pop(); };
   F.staffById = (state, id) => state.staff.find((s) => s.id === id);
   F.attorneys = (state) => state.staff.filter((s) => s.role === 'attorney' || s.role === 'trial');
   F.openCases = (state) => state.cases.filter(C.isOpen);
@@ -165,8 +168,10 @@
       loads[c.attorneyId] = (loads[c.attorneyId] || 0) + C.workNeed(c) * (c.flags.includes('language') ? 1.2 : 1);
     }
     state.loads = {};
+    const attCount = Math.max(1, F.attorneys(state).length);
+    const support = Math.min(6, ((state.staffCounts.paralegal || 0) * 4 + (state.staffCounts.casemgr || 0) * 2) / attCount);
     for (const att of F.attorneys(state)) {
-      const cap = F.capacity(state, att);
+      const cap = F.capacity(state, att) + support;
       const need = loads[att.id] || 0;
       const speed = need <= cap ? 1 : PI.clamp(cap / need, 0.15, 1);
       state.loads[att.id] = { cap, need, speed };
@@ -245,7 +250,7 @@
       const ch = D.CHANNELS[chId];
       let n = ch.passive ? 0 : F.channelLeadsPerWeek(state, chId);
       if (chId === 'referral') {
-        n = 0.2 + (state.reputation / 100) * 0.8 + Math.min(1.0, state.stats.resolved * 0.002);
+        n = 0.2 + (state.reputation / 100) * 0.9;
         if (state.referralCredits > 0 && R.chance(0.5)) { state.referralCredits--; n += 1; }
       }
       let count = Math.floor(n);
@@ -289,7 +294,11 @@
       const room = F.attorneys(state).length * 22;
       if (l.defendant.uninsured && !l.client.umLimit) { F.declineLead(state, l.id); continue; }
       const daysLeft = l.solDay - state.day;
-      if (exp < 4000 || (open > room && exp < 40000) || (l.liability.bucket === 'weak' && intakeSkill < 7) || (daysLeft < 150 && exp < 50000) || (D.CASE_TYPES[l.type].expertRequired && state.cash < 60000)) { F.declineLead(state, l.id); continue; }
+      const sel = (state.strategy && state.strategy.selectivity) || 'selective';
+      let decline = (daysLeft < 120 && exp < 50000) || (D.CASE_TYPES[l.type].expertRequired && state.cash < 60000);
+      if (sel === 'selective') decline = decline || exp < 6000 || (open > room && exp < 40000) || (l.liability.bucket === 'weak' && intakeSkill < 7);
+      if (sel === 'strong') decline = decline || exp < 15000 || l.liability.bucket !== 'clear' || (l.known.flags || []).some((f) => ['prior_claims', 'difficult', 'social', 'minor_damage'].includes(f));
+      if (decline) { F.declineLead(state, l.id); continue; }
       F.signLead(state, l.id);
     }
   };
@@ -508,8 +517,14 @@
     const fees = state.ledger.filter((l) => l.cat === 'fees' && l.day > state.day - 30).reduce((a, l) => a + l.amount, 0);
     F.log(state, `Month closed. Fees ${PI.money(fees)}, overhead ${PI.money(o.total)}, cash ${PI.money(state.cash)}${state.debt ? `, debt ${PI.money(state.debt)}` : ''}.`);
     // Reputation drifts slowly toward what the firm is actually doing.
-    const target = 15 + Math.min(45, state.stats.resolved * 0.3) + state.stats.trialWins * 2 + D.OFFICES[state.office].rep + state.offices.length * 3 + (state.marketing.tv || 0) * 2 + (state.marketing.billboard || 0);
+    const avgSat = state.stats.satN ? state.stats.satSum / state.stats.satN : 60;
+    const target = 15 + Math.min(35, state.stats.resolved * 0.25) + (avgSat - 60) * 0.6 + state.stats.trialWins * 1.5 + D.OFFICES[state.office].rep + state.offices.length * 3 + (state.marketing.tv || 0) * 2 + (state.marketing.billboard || 0) + (state.marketing.sponsorship || 0) * 2;
     state.reputation += (PI.clamp(target, 0, 100) - state.reputation) * 0.05;
+    const acceptRatio = state.stats.acceptN ? state.stats.acceptRatioSum / state.stats.acceptN : 0.85;
+    const filedRate = state.stats.resolved ? (state.stats.settledLit + state.stats.trials) / state.stats.resolved : 0.1;
+    const crTarget = PI.clamp(30 + (acceptRatio - 0.85) * 120 + filedRate * 40 + state.stats.trialWins * 2 - state.stats.trialLosses, 0, 100);
+    state.carrierRep = PI.clamp((state.carrierRep == null ? 30 : state.carrierRep) + (crTarget - state.carrierRep) * 0.06, 0, 100);
+    for (const k of Object.values(state.carriers || {})) k.credibility *= 0.97;
   };
   F.yearly = function (state, closedYear) {
     const fees = state.ledger.filter((l) => l.cat === 'fees' && l.day > state.day - 365).reduce((a, l) => a + l.amount, 0);
@@ -696,6 +711,11 @@
   const origRoll = F.rollEvents;
   F.rollEvents = function (state) {
     if (state.scheduled) for (const s of state.scheduled.slice()) if (state.week >= s.week) { state.scheduled.splice(state.scheduled.indexOf(s), 1); F.queueEvent(state, s.id); }
+    if (state.scheduledCaseEvents) for (const e of state.scheduledCaseEvents.slice()) if (state.week >= e.week) {
+      state.scheduledCaseEvents.splice(state.scheduledCaseEvents.indexOf(e), 1);
+      const c = state.cases.find((x) => x.id === e.caseId);
+      if (c && e.kind === 'early_regret') { F.log(state, `${c.clientName} needed ${c.severity >= 3 ? 'surgery' : 'months more treatment'} after the early settlement and has no way to pay for it. A one-star review followed.`, 'bad'); F.adjustRep(state, c.severity >= 3 ? -3 : -1.5); if (c.severity >= 3 && R.chance(0.2)) F.barComplaint(state, `${c.clientName} says the firm pushed a quick settlement.`); }
+    }
     if (state.modifiers.massTortDue && state.day >= state.modifiers.massTortDue) { const pay = Math.round(150000 * state.modifiers.massTortMult); F.earn(state, pay, 'Mass tort common benefit fee', 'fees'); state.stats.feesEarned += pay; F.log(state, `The MDL settled globally. Your committee share: ${PI.money(pay)}.`, pay > 150000 ? 'good' : 'bad'); delete state.modifiers.massTortDue; }
     if (state.modifiers.tortReformUntil && state.day > state.modifiers.tortReformUntil) { delete state.modifiers.tortReformUntil; state.city = D.CITIES.find((c) => c.id === state.cityId); F.log(state, 'The damages cap was struck down by the state supreme court.', 'good'); }
     origRoll(state);
@@ -710,6 +730,9 @@
     const s = o.state;
     s.city = D.CITIES.find((c) => c.id === s.cityId) || s.city;
     if (s.modifiers && s.modifiers.tortReformUntil) s.city = Object.assign({}, s.city, { venue: s.city.venue * 0.85 });
+    if (s.carrierRep == null) s.carrierRep = 30;
+    s.carriers = s.carriers || {};
+    s.strategy = s.strategy || { philosophy: 'balanced', selectivity: 'selective' };
     F.recount(s);
     return s;
   };

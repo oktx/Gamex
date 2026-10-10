@@ -182,10 +182,10 @@ tr.clickable:hover td { background: var(--surface-2); }
 .modal { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; width: min(640px, 100%); max-height: 100%; overflow-y: auto; padding: 20px 22px; display: flex; flex-direction: column; gap: 14px; box-shadow: var(--shadow); }
 .modal.wide { width: min(900px, 100%); }
 .modal h2 { font-size: 19px; }
-.modal .options { display: flex; flex-direction: column; gap: 8px; }
-.modal .options button { text-align: left; display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; white-space: normal; align-items: flex-start; }
-.modal .options button .desc { font-size: 12px; color: var(--muted); font-weight: 400; }
-.modal .options button.primary .desc { color: var(--accent-fg); opacity: 0.85; }
+.options { display: flex; flex-direction: column; gap: 8px; }
+.options button { text-align: left; display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; white-space: normal; align-items: flex-start; width: 100%; }
+.options button .desc { font-size: 12px; color: var(--muted); font-weight: 400; }
+.options button.primary .desc { color: var(--accent-fg); opacity: 0.85; }
 .presets { display: flex; gap: 6px; flex-wrap: wrap; }
 .amount-input { display: flex; gap: 8px; align-items: center; }
 .amount-input input { font-family: var(--font-mono); font-size: 18px; width: 200px; }
@@ -744,6 +744,13 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     return m;
   }
   C.specials = (c) => c.treatment.plan.reduce((a, p) => a + p.billed, 0);
+  C.treatmentStatus = function (c) {
+    const t = c.treatment;
+    if (t.mmi) return { label: 'MMI reached', pct: 100, kind: 'good' };
+    if (t.inGap) return { label: `Gap in care (${t.gapWeeks} wk)`, pct: Math.round((1 - t.weeksLeft / Math.max(1, t.weeksTotal)) * 100), kind: 'danger' };
+    const pct = Math.round(PI.clamp(1 - t.weeksLeft / Math.max(1, t.weeksTotal), 0, 0.99) * 100);
+    return { label: `Treating, ~${PI.weeksToText(Math.max(1, Math.round(t.weeksLeft)))} left`, pct, kind: '' };
+  };
   // The true full value of the case if liability were 100%.
   C.trueValue = function (state, c) {
     const S = D.SEVERITY[c.severity];
@@ -761,6 +768,15 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     if (c.litigation && c.litigation.imePenalty) v *= 1 - c.litigation.imePenalty;
     if (c.litigation && c.litigation.depoMod) v *= 1 + c.litigation.depoMod;
     return Math.max(1000, v);
+  };
+  // What the case would be worth fully worked up: the yardstick clients eventually measure you against.
+  C.potentialValue = function (state, c) {
+    const S = D.SEVERITY[c.severity];
+    const mult = (S.mult[0] + S.mult[1]) / 2;
+    const specials = Math.max(C.specials(c), c.specialsTarget);
+    let v = (specials * mult + c.wage + c.futureMeds + c.futureWage) * state.city.venue * (D.CASE_TYPES[c.type].biasMult || 1) * flagsValueMult(c) * (1 + c.client.credibility);
+    const cf = c.liability.cf;
+    return Math.max(1000, v * C.effectiveLiability(c) * (cf >= 0.5 ? 0 : 1 - cf));
   };
   C.expectedValue = function (state, c) {
     const L = C.effectiveLiability(c);
@@ -826,6 +842,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     if (c.stage === 'litigation') decay += 0.4;
     decay *= 1 - 0.7 * ctx.cm;
     if (ctx.speed < 0.6) decay *= 1.6;
+    if (ctx.speed < 0.5 && R.chance(0.012)) { c.client.mood -= 10; c.client.credibility -= 0.02; C.log(state, c, 'Nobody returned the client\'s calls for three weeks and a records deadline was missed. The file is moving, barely.', 'warn'); if (R.chance(0.25)) PI.Firm.barComplaint(state, `${c.clientName} complained that nobody at the firm knows their case.`); }
     if (ctx.speed < 0.5 && c.stage === 'litigation' && R.chance(0.04)) { c.litigation.depoMod = (c.litigation.depoMod || 0) - 0.03; C.log(state, c, 'A discovery deadline slipped because the attorney is overloaded. Defense counsel noticed.', 'warn'); }
     if (weeksSinceContact > 4) c.client.mood -= decay * Math.min(2, (weeksSinceContact - 2) / 4);
     if (ctx.cm > 0.5 && R.chance(0.3 * ctx.cm)) { c.client.lastContactWeek = state.week; c.client.mood = Math.min(100, c.client.mood + 3); }
@@ -885,7 +902,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
             if (p.id === 'surgery' || p.id === 'rehab') {
               // Surgery happens around the middle of treatment.
               if (t.weeksLeft < t.weeksTotal * 0.6) { p.billed = amt; p.done = true; t.surgeryDone = p.id === 'surgery' || t.surgeryDone; C.log(state, c, `${p.name} completed. Billed ${PI.money(amt)}.`); }
-            } else { p.billed = amt; p.done = true; }
+            } else { p.billed = amt; p.done = true; if (['ortho', 'mri', 'pain', 'neuro'].includes(p.id)) C.log(state, c, `Client seen by ${p.name.toLowerCase()}. Billed ${PI.money(amt)}.`); }
           }
         } else {
           p.billed += perWeekBudget * 0.35 / Math.max(1, open.filter((q) => !providers[q.id].once).length) + R.range(def.perWeek[0], def.perWeek[1]) * 0.5;
@@ -931,6 +948,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       if (!merged[key]) merged[key] = l; else merged[key].amount += l.amount;
     }
     c.liens = Object.values(merged);
+    c.liensBuilt = true;
     if (c.flags.includes('comp')) c.liens.push({ type: 'comp', holder: 'Workers\' compensation carrier', amount: Math.round(C.specials(c) * 0.5 + c.wage * 0.66), status: 'open' });
     if (cl.medpay && c.medpayUsed) c.liens.push({ type: 'medpay', holder: 'Client\'s auto carrier (med-pay)', amount: c.medpayUsed, status: 'open' });
     if (R.chance(0.04)) c.liens.push({ type: 'childsupport', holder: 'State child support enforcement', amount: R.int(2000, 18000), status: 'open' });
@@ -960,7 +978,9 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       if (L > 0.8 - style * 0.15 && c.liability.cf < 0.1) det = 'accepted';
       else if (L < 0.45 || (style > 0.7 && L < 0.6)) det = 'denied';
       else det = 'disputed';
+      if ((c.liability.evidence.video || c.liability.evidence.witnesses) && c.liability.cf > 0) { c.liability.cf *= 0.5; }
       c.liability.determination = det;
+      c.liability.evidenceAtDet = Object.keys(c.liability.evidence).length;
       c.known.liability = true;
       const cfText = c.liability.cf > 0 ? ` They assert ${Math.round(c.liability.cf * 100)}% comparative fault on your client.` : '';
       C.log(state, c, det === 'accepted' ? 'Carrier accepted liability.' : det === 'disputed' ? `Carrier disputes liability.${cfText}` : `Carrier denied liability outright.${cfText}`, det === 'accepted' ? 'good' : 'warn');
@@ -1021,14 +1041,18 @@ canvas.chart { width: 100%; height: 160px; display: block; }
   }
 
   // Hidden reserve: what the adjuster is actually authorized to pay right now.
-  C.reserve = function (state, c, inLit) {
+  C.reserve = function (state, c, inLit, ignoreDemand) {
     const ins = D.INSURERS.find((i) => i.id === c.defendant.insurer);
     const adj = D.ADJUSTER_STYLES.find((s) => s.id === c.defendant.adjusterStyle) || D.ADJUSTER_STYLES[1];
     let exp = C.expectedValue(state, c);
     let factor = 1 - ins.style * 0.45 - adj.mod;
     if (inLit) factor = 0.88 - ins.style * 0.12 + (c.litigation.stageIndex || 0) * 0.015;
     factor += (skill(state, c, 'negotiation') - 5) * 0.025;
-    factor += (state.reputation / 100) * 0.08 + Math.min(0.1, state.stats.trialWins * 0.015);
+    // Carriers reserve against the firm's record, not its billboards.
+    factor += (((state.carrierRep == null ? 30 : state.carrierRep) - 40) / 100) * 0.3;
+    const cred = PI.Firm.carrier(state, c.defendant.insurer).credibility;
+    factor += cred * 0.012;
+    if (!c.treatment.mmi) { const prog = PI.clamp(1 - c.treatment.weeksLeft / Math.max(1, c.treatment.weeksTotal), 0, 1); factor *= 0.72 + 0.22 * prog; } // open-ended treatment: the adjuster discounts hard
     if (c.liability.determination === 'denied' && !inLit) factor *= 0.4;
     const ev = c.liability.evidence;
     if (ev.video || ev.witnesses) factor += 0.04;
@@ -1036,9 +1060,17 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     if (c.demand && c.demand.quality) factor += (c.demand.quality - 1) * 0.1;
     let r = exp * PI.clamp(factor, 0.2, 1.1);
     // Demands below the reserve are accepted: an anchor set low is money left behind.
-    if (c.demand && c.demand.amount && c.demand.amount < r) r = c.demand.amount;
+    if (!ignoreDemand && c.demand && c.demand.amount && c.demand.amount < r) r = c.demand.amount;
     const cap = C.collectible(state, c);
     return Math.min(r, cap);
+  };
+
+  // What the attorney thinks the carrier will authorize: a range that narrows with negotiation skill.
+  C.carrierRead = function (state, c) {
+    const r = C.reserve(state, c, c.stage === 'litigation', true);
+    const sk = skill(state, c, 'negotiation');
+    const noise = 0.45 - sk * 0.035;
+    return { lo: Math.round(r * (1 - noise) / 500) * 500, hi: Math.round(r * (1 + noise) / 500) * 500 };
   };
 
   C.sendDemand = function (state, c, amount, timeLimited) {
@@ -1051,11 +1083,18 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     c.demand.quality = 0.9 + skill(state, c, 'negotiation') / 50 + (state.staffCounts && state.staffCounts.paralegal ? 0.05 : 0);
     c.pending = null;
     c.demand.ready = true;
+    const raw = C.reserve(state, c, false, true);
+    c.demand.ratio = amount / Math.max(1, raw);
+    if (c.demand.ratio > 2.5) PI.Firm.carrierNote(state, c.defendant.insurer, -1, 'unreasonable demand');
+    if (timeLimited && C.expectedValue(state, c) < cap * 0.7) { PI.Firm.carrierNote(state, c.defendant.insurer, -2, 'bluffed a policy-limits demand'); state.carrierRep = PI.clamp((state.carrierRep || 30) - 1, 0, 100); }
     c.docs.push({ day: state.day, name: `Demand letter (${PI.money(amount)}${timeLimited ? ', time-limited policy-limits demand' : ''})` });
     C.log(state, c, `Demand sent for ${PI.money(amount)}${timeLimited ? ' as a time-limited policy-limits demand with a 30-day deadline' : ''}.`, 'stage');
     if (amount > C.trueValue(state, c) * 4 && cap > amount) C.log(state, c, 'The demand is far above any realistic valuation. Expect the adjuster to treat it as noise.', 'warn');
     setStage(state, c, 'negotiation');
-    c.negotiation = { round: 0, offers: [], currentOffer: 0, responseWeek: state.week + R.int(2, 4), finalOffer: false, patience: (D.ADJUSTER_STYLES.find((s) => s.id === c.defendant.adjusterStyle) || D.ADJUSTER_STYLES[1]).patience, escalated: false, awaiting: true };
+    const basePatience = (D.ADJUSTER_STYLES.find((s) => s.id === c.defendant.adjusterStyle) || D.ADJUSTER_STYLES[1]).patience;
+    c.negotiation = { round: 0, offers: [], currentOffer: 0, responseWeek: state.week + R.int(2, 4), finalOffer: false, patience: basePatience, escalated: false, awaiting: true };
+    if (c.demand.ratio > 2.5) { c.negotiation.patience += 1; c.negotiation.lowStart = true; C.log(state, c, 'The demand is well above the carrier\'s evaluation. Expect a lower opening offer and more rounds.', 'warn'); }
+    else if (c.demand.ratio < 1.35) { c.negotiation.patience = Math.max(2, basePatience - 1); c.negotiation.quickClose = true; }
     if (timeLimited) c.negotiation.responseWeek = state.week + R.int(3, 5);
   };
 
@@ -1109,7 +1148,8 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       return;
     }
     const progress = Math.min(1, Math.pow(n.round / n.patience, 0.75));
-    let offer = reserve * (0.4 + 0.58 * progress) * R.range(0.95, 1.03);
+    const start = n.lowStart ? 0.3 : n.quickClose ? 0.6 : 0.4;
+    let offer = reserve * (start + (0.98 - start) * progress) * R.range(0.95, 1.03);
     if (n.lastCounter && n.lastCounter <= reserve * 1.08) offer = Math.max(offer, Math.min(n.lastCounter, reserve) * R.range(0.96, 1.0));
     if (n.round >= n.patience) { n.finalOffer = true; offer = Math.max(offer, reserve * R.range(0.96, 1.0)); }
     offer = Math.max(offer, n.currentOffer * 1.01);
@@ -1144,6 +1184,11 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     const n = c.negotiation || {};
     const inLit = c.stage === 'litigation';
     c.pending = null;
+    const raw = C.reserve(state, c, inLit, true);
+    const ratio = amount / Math.max(1, raw);
+    state.stats.acceptRatioSum = (state.stats.acceptRatioSum || 0) + Math.min(1.2, ratio); state.stats.acceptN = (state.stats.acceptN || 0) + 1;
+    if (ratio < 0.72 && !n.finalOffer && !inLit) { PI.Firm.carrierNote(state, c.defendant.insurer, -1, 'took an early lowball'); state.carrierRep = PI.clamp((state.carrierRep || 30) - 0.8, 0, 100); C.log(state, c, 'Accepted well below the carrier\'s authority. Adjusters remember who folds.', 'warn'); }
+    else if (ratio >= 0.95) { state.carrierRep = PI.clamp((state.carrierRep || 30) + 0.25, 0, 100); }
     C.log(state, c, `Settled for ${PI.money(amount)}${inLit ? ' during litigation' : ' pre-suit'}. Release signed; check expected within weeks.`, 'good');
     c.docs.push({ day: state.day, name: 'Settlement agreement and release' });
     startDisbursement(state, c, amount, inLit ? 'settled_lit' : 'settled');
@@ -1173,6 +1218,8 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     if (!c.negotiation) c.negotiation = { round: 0, offers: [], currentOffer: 0, awaiting: false, patience: 4 };
     c.negotiation.awaiting = false;
     C.addCost(state, c, 450, 'Filing fee');
+    state.carrierRep = PI.clamp((state.carrierRep || 30) + 0.6, 0, 100);
+    PI.Firm.carrierNote(state, c.defendant.insurer, 1, 'filed suit');
     c.docs.push({ day: state.day, name: 'Complaint and jury demand' });
     C.log(state, c, `Complaint filed in ${lit.court}, assigned to ${lit.judge}. Fee converts to 40% under the retainer agreement.`, 'stage');
     if (c.stage !== 'litigation') setStage(state, c, 'litigation');
@@ -1337,6 +1384,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       C.log(state, c, `Defense verdict. The jury found ${cf > 0 ? 'your client more than 50% at fault' : 'no negligence by the defendant'}. The firm absorbs ${PI.money(c.costs)} in costs.`, 'bad');
       PI.Firm.log(state, `Defense verdict in ${c.clientName}. ${PI.money(c.costs)} in costs written off.`, 'bad');
       PI.Firm.adjustRep(state, -1);
+      state.carrierRep = PI.clamp((state.carrierRep || 30) - 1.5, 0, 100);
       c.client.mood -= 30;
       return C.kill(state, c, 'lost', 'Case lost at trial.', false);
     }
@@ -1353,6 +1401,8 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     C.log(state, c, `Plaintiff's verdict: ${PI.money(gross)}.${collectible < gross ? ` Only ${PI.money(collectible)} is collectible against the available coverage.` : ''}`, 'good');
     PI.Firm.log(state, `Jury verdict of ${PI.money(gross)} for ${c.clientName}.`, 'good');
     PI.Firm.adjustRep(state, gross > 1000000 ? 4 : 2);
+    state.carrierRep = PI.clamp((state.carrierRep || 30) + (gross > 1000000 ? 6 : 4), 0, 100);
+    PI.Firm.carrierNote(state, c.defendant.insurer, 3, 'beat them at trial');
     if (gross > 1000000) PI.Firm.news(state, `Local jury hands down ${PI.money(gross, { short: true })} verdict against ${c.defendant.name}; ${state.firmName} tried the case.`);
     // Appeal risk.
     if (gross > 400000 && R.chance(0.35)) { C.log(state, c, 'Defense filed a notice of appeal. Expect a year or more before the judgment is paid.', 'warn'); advanceLit(state, c, D.LIT_STAGES.findIndex((s) => s.id === 'appeal')); return; }
@@ -1369,7 +1419,9 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       if (uimAdd > 0) C.log(state, c, `UIM carrier paid ${PI.money(uimAdd)} on top of the liability settlement.`, 'good');
     }
     if (c.defendant.uninsured && c.client.umLimit) { gross = Math.min(gross, c.client.umLimit); }
-    c.settlement = { gross: Math.round(gross + uimAdd), how, day: state.day, weeksToCheck: how === 'verdict' ? R.int(4, 10) : R.int(2, 4), liensNegotiated: false, negotiatingWeeks: 0, disbursed: false };
+    if (!c.liensBuilt) buildLiens(state, c);
+    c.settlement = { gross: Math.round(gross + uimAdd), how, day: state.day, weeksToCheck: how === 'verdict' ? R.int(4, 10) : R.int(2, 4), liensNegotiated: false, negotiatingWeeks: 0, disbursed: false, early: !c.treatment.mmi };
+    if (!c.treatment.mmi) { c.treatment.mmi = true; c.treatment.weeksLeft = 0; C.log(state, c, 'Settled before maximum medical improvement. The release covers any future treatment.', 'warn'); }
     if (c.flags.includes('child')) { c.settlement.weeksToCheck += 6; C.log(state, c, 'Minor\'s settlement requires court approval. Petition filed.'); }
     c.negotiation = c.negotiation || {}; c.negotiation.awaiting = false;
     setStage(state, c, 'disbursement');
@@ -1452,14 +1504,19 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     if (st.costs) PI.Firm.earn(state, st.costs, `Case costs reimbursed: ${c.clientName}`, 'costs_recovered');
     if (st.referral) PI.Firm.log(state, `Paid ${PI.money(st.referral)} referral fee on ${c.clientName}.`);
     state.stats.feesEarned += st.feeNet - st.referral;
+    { const k = PI.Firm.carrier(state, c.defendant.insurer); k.cases++; k.paid += st.gross; }
     state.stats.recovered += st.gross;
     state.stats.resolved++;
     state.stats.biggestSettlement = Math.max(state.stats.biggestSettlement, st.gross);
     if (s.how === 'settled') state.stats.settledPreSuit++; else if (s.how === 'settled_lit') state.stats.settledLit++;
-    const exp = C.expectedValue(state, c);
+    const exp = Math.max(C.expectedValue(state, c), s.early ? C.potentialValue(state, c) : 0);
     const ratio = st.net / Math.max(1, exp * 0.5 * c.client.expectations);
-    let sat = PI.clamp(40 + ratio * 35 + (c.client.mood - 50) * 0.5 - (state.day - c.createdDay) / 60, 0, 100);
+    const weeksOpen = (state.day - (c.signedDay || c.createdDay)) / 7;
+    const processed = (1 - (c.speedLast || 1)) * 25; // clients can tell when they are a file number
+    let sat = PI.clamp(40 + ratio * 35 + (c.client.mood - 50) * 0.5 - weeksOpen / 8 + (weeksOpen < 30 && ratio > 1 ? 8 : 0) - processed, 0, 100);
     c.satisfaction = Math.round(sat);
+    state.stats.satSum = (state.stats.satSum || 0) + c.satisfaction; state.stats.satN = (state.stats.satN || 0) + 1;
+    if (s.early && c.severity >= 2 && R.chance(c.severity >= 3 ? 0.5 : 0.25)) { state.scheduledCaseEvents = state.scheduledCaseEvents || []; state.scheduledCaseEvents.push({ week: state.week + R.int(8, 30), caseId: c.id, kind: 'early_regret' }); }
     c.stage = 'closed'; c.closedDay = state.day; c.pending = null;
     C.log(state, c, `Disbursed. Client netted ${PI.money(st.net)}; firm fee ${PI.money(st.feeNet)}${st.feeCut ? ` (fee reduced by ${PI.money(st.feeCut)} so the client nets something)` : ''}. Client satisfaction ${c.satisfaction}/100.`, 'good');
     PI.Firm.log(state, `${c.clientName} closed: ${PI.money(st.gross)} gross, ${PI.money(st.feeNet)} fee.`, 'good');
@@ -1497,6 +1554,8 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     }
     if (open && c.stage !== 'disbursement') a.push({ id: 'call', name: 'Call the client', desc: 'A twenty-minute status call. Keeps the client treating, informed and loyal.', cost: 0 });
     if (c.known.um && c.client.umLimit > 0 && !c.uim && !c.defendant.uninsured && c.client.umLimit > c.defendant.limits && c.known.limits) a.push({ id: 'uim', name: 'Open UIM claim', desc: `Client's ${PI.money(c.client.umLimit)} UIM limits exceed the defendant's ${PI.money(c.defendant.limits)}. The client's own carrier pays the difference.`, cost: 0 });
+    if (['investigation', 'treatment'].includes(c.stage) && c.liability.determination != null && !c.treatment.mmi && C.specials(c) > 0) a.push({ id: 'demand_early', name: 'Demand now, before MMI', desc: 'The volume play: settle on the bills to date. Faster money, smaller case, and the client signs away future treatment. Carriers discount an open-ended injury by about 12%.', cost: 0, group: 'strategy' });
+    if (['treatment', 'records', 'demand', 'negotiation'].includes(c.stage) && ['disputed', 'denied'].includes(c.liability.determination) && !c.liability.reevaluated && Object.keys(c.liability.evidence).length > (c.liability.evidenceAtDet || 0)) a.push({ id: 'reeval', name: 'Submit new evidence to carrier', desc: 'Ask the adjuster to reconsider liability in light of what the investigation turned up. One shot.', cost: 0 });
     if (c.stage === 'demand' && c.demand && c.demand.ready && !c.demand.sent) a.push({ id: 'demand', name: 'Set demand and send', desc: 'Pick the number. Anchors the whole negotiation.', cost: 0, primary: true });
     if (c.stage === 'negotiation' && !c.negotiation.awaiting && c.pending && c.pending.type === 'offer') a.push({ id: 'respond', name: 'Respond to offer', desc: `Current offer: ${PI.money(c.negotiation.currentOffer)}.`, cost: 0, primary: true });
     if (c.stage === 'negotiation' && c.negotiation.round > 0 && !c.negotiation.escalated && !c.negotiation.awaiting) a.push({ id: 'escalate', name: 'Escalate to supervisor', desc: 'Demand a supervisor review and put the carrier on notice of bad faith. One shot per case.', cost: 0 });
@@ -1542,8 +1601,10 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       case 'spoliation': {
         c.spoliationSent = true;
         c.docs.push({ day: state.day, name: 'Preservation (spoliation) letters' });
-        const chance = c.flags.includes('dashcam') ? 1 : T.cat === 'premises' || c.type === 'trucking' || c.type === 'rideshare' ? 0.55 : 0.3;
-        if (R.chance(chance)) gainEvidence(state, c, 'video', 'Preservation letter'); else C.log(state, c, 'Preservation letters sent. No footage surfaced; the store says its system overwrites every 72 hours.', 'warn');
+        const weeksSince = (state.day - c.incidentDay) / 7;
+        const decay = Math.max(0.1, 1 - Math.max(0, weeksSince - 2) / 10);
+        const chance = c.flags.includes('dashcam') ? 1 : (T.cat === 'premises' || c.type === 'trucking' || c.type === 'rideshare' ? 0.7 : 0.4) * decay;
+        if (R.chance(chance)) gainEvidence(state, c, 'video', 'Preservation letter'); else C.log(state, c, weeksSince > 6 ? 'Preservation letters sent too late. Every camera in the area had already overwritten the footage.' : 'Preservation letters sent. No footage surfaced; the store says its system overwrites every 72 hours.', 'warn');
         if (c.type === 'trucking' && R.chance(0.6)) gainEvidence(state, c, 'blackbox', 'Preservation letter');
         return true;
       }
@@ -1563,6 +1624,28 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       case 'uim': C.openUIM(state, c); return true;
       case 'demand': if (payload.amount) C.sendDemand(state, c, Math.round(payload.amount), payload.timeLimited); return true;
       case 'escalate': C.escalate(state, c); return true;
+      case 'demand_early': {
+        c.earlyDemand = true;
+        for (const p of c.treatment.plan) if (p.billed > 0) { p.recordsRequested = true; p.recordsReceived = true; C.addCost(state, c, R.int(25, 120), `Records to date from ${p.name}`); }
+        c.records.started = true; c.records.complete = true;
+        c.demand = { drafted: 0, draftNeed: 2 + Math.floor(c.severity / 2), sent: false };
+        C.log(state, c, 'Decided to demand on the bills to date rather than wait for maximum medical improvement.', 'stage');
+        setStage(state, c, 'demand');
+        return true;
+      }
+      case 'reeval': {
+        c.liability.reevaluated = true;
+        const L = C.effectiveLiability(c);
+        const style = D.INSURERS.find((i) => i.id === c.defendant.insurer).style;
+        const before = c.liability.determination;
+        if ((c.liability.evidence.video || c.liability.evidence.witnesses) && c.liability.cf > 0) c.liability.cf *= 0.5;
+        let det;
+        if (L > 0.78 - style * 0.15 && c.liability.cf < 0.1) det = 'accepted'; else if (L < 0.45) det = 'denied'; else det = 'disputed';
+        c.liability.determination = det;
+        c.liability.evidenceAtDet = Object.keys(c.liability.evidence).length;
+        C.log(state, c, det === before ? `Carrier reviewed the new evidence and kept its position (${det}).` : `Carrier revised its liability position from ${before} to ${det}.`, det === before ? 'warn' : 'good');
+        return true;
+      }
       case 'file': return C.fileSuit(state, c);
       case 'reopen': c.negotiation.awaiting = true; c.negotiation.responseWeek = state.week + R.int(2, 4); if (payload.amount) { c.negotiation.lastCounter = payload.amount; c.negotiation.offers.push({ day: state.day, from: 'firm', amount: payload.amount }); } C.log(state, c, `Renewed demand sent to defense counsel${payload.amount ? ` at ${PI.money(payload.amount)}` : ''}.`); return true;
       case 'accept': {
@@ -1592,6 +1675,12 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     const neg = att ? att.skills.negotiation : 5;
     const lit = att ? att.skills.litigation : 5;
     const T = D.CASE_TYPES[c.type];
+    const phil = (state.strategy && state.strategy.philosophy) || 'balanced';
+    const acceptMult = phil === 'volume' ? 0.72 : phil === 'value' ? 0.97 : 0.85;
+    // Volume shops demand on the bills to date as soon as liability is settled.
+    if (phil === 'volume' && ['investigation', 'treatment'].includes(c.stage) && c.liability.determination && c.liability.determination !== 'denied' && !c.treatment.mmi && C.specials(c) > 2000 && c.weeksInStage >= 3) { C.act(state, c, 'demand_early'); return; }
+    if (phil === 'value' && ['investigation', 'treatment'].includes(c.stage)) { const acts0 = C.actions(state, c); if (acts0.find((x) => x.id === 'refer_specialist') && c.liability.determination !== 'denied') C.act(state, c, 'refer_specialist'); if (acts0.find((x) => x.id === 'investigator')) C.act(state, c, 'investigator'); if (acts0.find((x) => x.id === 'scene')) C.act(state, c, 'scene'); }
+    if (C.actions(state, c).find((x) => x.id === 'reeval')) C.act(state, c, 'reeval');
     // Routine investigation tasks happen automatically.
     if (['investigation', 'treatment'].includes(c.stage)) {
       const acts = C.actions(state, c).filter((x) => ['notice', 'police', 'photos', 'spoliation', 'limits', 'um', 'health', 'medpay', 'uim'].includes(x.id) || (x.id === 'investigator' && c.severity >= 2) || (x.id === 'scene' && T.cat === 'premises'));
@@ -1617,7 +1706,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       const cap = C.collectible(state, c);
       const load = state.loads && state.loads[c.attorneyId] ? state.loads[c.attorneyId] : { speed: 1 };
       const busy = load.speed < 0.75;
-      const target = Math.min(cap, exp * (0.62 + neg * 0.03) * (busy ? 0.85 : 1));
+      const target = Math.min(cap, exp * (0.62 + neg * 0.03) * (busy ? 0.85 : 1) * acceptMult);
       const offer = n.currentOffer;
       const solWeeks = (c.solDay - state.day) / 7;
       const inLit = c.stage === 'litigation';
@@ -1625,13 +1714,14 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       else if (inLit) {
         const steps = c.litigation.stageIndex >= 8;
         if (offer > 0 && c.litigation.stageIndex >= 7 && offer >= target * 0.7 && lit < 7) C.act(state, c, 'accept');
-        else if (steps && offer >= target * 0.6 && (lit < 8 || R.chance(0.6))) C.act(state, c, 'accept');
+        else if (steps && offer >= target * (phil === 'value' ? 0.75 : 0.6) && (lit < 8 || R.chance(phil === 'value' ? 0.35 : 0.7))) C.act(state, c, 'accept');
         else C.act(state, c, 'reject');
       }
       else if (n.finalOffer || n.round >= n.patience + 1 || solWeeks < 10) {
         const needExpert = T.expertRequired && !(c.litigation && c.litigation.experts.some((e) => D.EXPERTS[e].required));
         if (needExpert && state.cash > 40000) { const req = Object.keys(D.EXPERTS).find((k) => D.EXPERTS[k].required && D.EXPERTS[k].types.includes(c.type)); C.retainExpert(state, c, req); }
-        const worthSuing = exp > (busy ? 60000 : 20000) && offer < target * 0.75 && state.cash > 5000 && !(T.expertRequired && !(c.litigation && c.litigation.experts.some((e) => D.EXPERTS[e].required)));
+        const sueFloor = phil === 'volume' ? 0.45 : phil === 'value' ? 0.9 : 0.75;
+        const worthSuing = exp > (busy ? 60000 : phil === 'volume' ? 50000 : 20000) && offer < target * sueFloor && state.cash > 5000 && !(T.expertRequired && !(c.litigation && c.litigation.experts.some((e) => D.EXPERTS[e].required)));
         if (worthSuing) { if (!C.fileSuit(state, c)) C.act(state, c, 'accept'); }
         else if (offer > 0) C.act(state, c, 'accept'); else if (solWeeks < 10) C.kill(state, c, 'dropped', 'Associate withdrew: no offer, no viable suit before the statute ran.');
         else C.act(state, c, 'counter', { amount: Math.round(Math.max(target * 1.3, offer * 1.4) / 500) * 500 });
@@ -1708,7 +1798,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     const bg = D.FOUNDER_BACKGROUNDS.find((b) => b.id === opts.backgroundId) || D.FOUNDER_BACKGROUNDS[0];
     const state = {
       version: F.SAVE_VERSION, seed: opts.seed, firmName: opts.firmName || 'Law Office of ' + opts.founderName, founderName: opts.founderName, city, cityId: city.id,
-      day: 0, week: 0, cash: bg.cash, debt: 0, creditLimit: 60000, reputation: 18, generation: 1, founderDraw: 3500,
+      day: 0, week: 0, cash: bg.cash, debt: 0, creditLimit: 60000, reputation: 18, carrierRep: 30, carriers: {}, strategy: { philosophy: 'balanced', selectivity: 'selective' }, generation: 1, founderDraw: 3500,
       office: 0, offices: [], staff: [], candidates: [], cases: [], leads: [], marketing: {}, channelSince: {},
       policy: { autoDelegate: true, autoAssign: true, insured: true, pauseOnDecision: true, autoIntake: false },
       stats: { feesEarned: 0, recovered: 0, resolved: 0, signed: 0, declined: 0, trials: 0, trialWins: 0, trialLosses: 0, biggestVerdict: 0, biggestSettlement: 0, settledPreSuit: 0, settledLit: 0, clientsLost: 0, malpractice: 0, barComplaints: 0, leadsLost: 0, leadsTotal: 0 },
@@ -1761,6 +1851,9 @@ canvas.chart { width: 100%; height: 160px; display: block; }
 
   // ---------- Helpers ----------
   F.founder = (state) => state.staff.find((s) => s.isFounder);
+  // Each carrier keeps a file on the firm.
+  F.carrier = function (state, id) { state.carriers = state.carriers || {}; return state.carriers[id] || (state.carriers[id] = { credibility: 0, cases: 0, paid: 0, filed: 0, notes: [] }); };
+  F.carrierNote = function (state, id, delta, why) { const k = F.carrier(state, id); k.credibility = PI.clamp(k.credibility + delta, -10, 10); k.notes.unshift({ day: state.day, delta, why }); if (k.notes.length > 8) k.notes.pop(); };
   F.staffById = (state, id) => state.staff.find((s) => s.id === id);
   F.attorneys = (state) => state.staff.filter((s) => s.role === 'attorney' || s.role === 'trial');
   F.openCases = (state) => state.cases.filter(C.isOpen);
@@ -1843,8 +1936,10 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       loads[c.attorneyId] = (loads[c.attorneyId] || 0) + C.workNeed(c) * (c.flags.includes('language') ? 1.2 : 1);
     }
     state.loads = {};
+    const attCount = Math.max(1, F.attorneys(state).length);
+    const support = Math.min(6, ((state.staffCounts.paralegal || 0) * 4 + (state.staffCounts.casemgr || 0) * 2) / attCount);
     for (const att of F.attorneys(state)) {
-      const cap = F.capacity(state, att);
+      const cap = F.capacity(state, att) + support;
       const need = loads[att.id] || 0;
       const speed = need <= cap ? 1 : PI.clamp(cap / need, 0.15, 1);
       state.loads[att.id] = { cap, need, speed };
@@ -1923,7 +2018,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       const ch = D.CHANNELS[chId];
       let n = ch.passive ? 0 : F.channelLeadsPerWeek(state, chId);
       if (chId === 'referral') {
-        n = 0.2 + (state.reputation / 100) * 0.8 + Math.min(1.0, state.stats.resolved * 0.002);
+        n = 0.2 + (state.reputation / 100) * 0.9;
         if (state.referralCredits > 0 && R.chance(0.5)) { state.referralCredits--; n += 1; }
       }
       let count = Math.floor(n);
@@ -1967,7 +2062,11 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       const room = F.attorneys(state).length * 22;
       if (l.defendant.uninsured && !l.client.umLimit) { F.declineLead(state, l.id); continue; }
       const daysLeft = l.solDay - state.day;
-      if (exp < 4000 || (open > room && exp < 40000) || (l.liability.bucket === 'weak' && intakeSkill < 7) || (daysLeft < 150 && exp < 50000) || (D.CASE_TYPES[l.type].expertRequired && state.cash < 60000)) { F.declineLead(state, l.id); continue; }
+      const sel = (state.strategy && state.strategy.selectivity) || 'selective';
+      let decline = (daysLeft < 120 && exp < 50000) || (D.CASE_TYPES[l.type].expertRequired && state.cash < 60000);
+      if (sel === 'selective') decline = decline || exp < 6000 || (open > room && exp < 40000) || (l.liability.bucket === 'weak' && intakeSkill < 7);
+      if (sel === 'strong') decline = decline || exp < 15000 || l.liability.bucket !== 'clear' || (l.known.flags || []).some((f) => ['prior_claims', 'difficult', 'social', 'minor_damage'].includes(f));
+      if (decline) { F.declineLead(state, l.id); continue; }
       F.signLead(state, l.id);
     }
   };
@@ -2186,8 +2285,14 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     const fees = state.ledger.filter((l) => l.cat === 'fees' && l.day > state.day - 30).reduce((a, l) => a + l.amount, 0);
     F.log(state, `Month closed. Fees ${PI.money(fees)}, overhead ${PI.money(o.total)}, cash ${PI.money(state.cash)}${state.debt ? `, debt ${PI.money(state.debt)}` : ''}.`);
     // Reputation drifts slowly toward what the firm is actually doing.
-    const target = 15 + Math.min(45, state.stats.resolved * 0.3) + state.stats.trialWins * 2 + D.OFFICES[state.office].rep + state.offices.length * 3 + (state.marketing.tv || 0) * 2 + (state.marketing.billboard || 0);
+    const avgSat = state.stats.satN ? state.stats.satSum / state.stats.satN : 60;
+    const target = 15 + Math.min(35, state.stats.resolved * 0.25) + (avgSat - 60) * 0.6 + state.stats.trialWins * 1.5 + D.OFFICES[state.office].rep + state.offices.length * 3 + (state.marketing.tv || 0) * 2 + (state.marketing.billboard || 0) + (state.marketing.sponsorship || 0) * 2;
     state.reputation += (PI.clamp(target, 0, 100) - state.reputation) * 0.05;
+    const acceptRatio = state.stats.acceptN ? state.stats.acceptRatioSum / state.stats.acceptN : 0.85;
+    const filedRate = state.stats.resolved ? (state.stats.settledLit + state.stats.trials) / state.stats.resolved : 0.1;
+    const crTarget = PI.clamp(30 + (acceptRatio - 0.85) * 120 + filedRate * 40 + state.stats.trialWins * 2 - state.stats.trialLosses, 0, 100);
+    state.carrierRep = PI.clamp((state.carrierRep == null ? 30 : state.carrierRep) + (crTarget - state.carrierRep) * 0.06, 0, 100);
+    for (const k of Object.values(state.carriers || {})) k.credibility *= 0.97;
   };
   F.yearly = function (state, closedYear) {
     const fees = state.ledger.filter((l) => l.cat === 'fees' && l.day > state.day - 365).reduce((a, l) => a + l.amount, 0);
@@ -2374,6 +2479,11 @@ canvas.chart { width: 100%; height: 160px; display: block; }
   const origRoll = F.rollEvents;
   F.rollEvents = function (state) {
     if (state.scheduled) for (const s of state.scheduled.slice()) if (state.week >= s.week) { state.scheduled.splice(state.scheduled.indexOf(s), 1); F.queueEvent(state, s.id); }
+    if (state.scheduledCaseEvents) for (const e of state.scheduledCaseEvents.slice()) if (state.week >= e.week) {
+      state.scheduledCaseEvents.splice(state.scheduledCaseEvents.indexOf(e), 1);
+      const c = state.cases.find((x) => x.id === e.caseId);
+      if (c && e.kind === 'early_regret') { F.log(state, `${c.clientName} needed ${c.severity >= 3 ? 'surgery' : 'months more treatment'} after the early settlement and has no way to pay for it. A one-star review followed.`, 'bad'); F.adjustRep(state, c.severity >= 3 ? -3 : -1.5); if (c.severity >= 3 && R.chance(0.2)) F.barComplaint(state, `${c.clientName} says the firm pushed a quick settlement.`); }
+    }
     if (state.modifiers.massTortDue && state.day >= state.modifiers.massTortDue) { const pay = Math.round(150000 * state.modifiers.massTortMult); F.earn(state, pay, 'Mass tort common benefit fee', 'fees'); state.stats.feesEarned += pay; F.log(state, `The MDL settled globally. Your committee share: ${PI.money(pay)}.`, pay > 150000 ? 'good' : 'bad'); delete state.modifiers.massTortDue; }
     if (state.modifiers.tortReformUntil && state.day > state.modifiers.tortReformUntil) { delete state.modifiers.tortReformUntil; state.city = D.CITIES.find((c) => c.id === state.cityId); F.log(state, 'The damages cap was struck down by the state supreme court.', 'good'); }
     origRoll(state);
@@ -2388,6 +2498,9 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     const s = o.state;
     s.city = D.CITIES.find((c) => c.id === s.cityId) || s.city;
     if (s.modifiers && s.modifiers.tortReformUntil) s.city = Object.assign({}, s.city, { venue: s.city.venue * 0.85 });
+    if (s.carrierRep == null) s.carrierRep = 30;
+    s.carriers = s.carriers || {};
+    s.strategy = s.strategy || { philosophy: 'balanced', selectivity: 'selective' };
     F.recount(s);
     return s;
   };
@@ -2464,7 +2577,8 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       <div class="brand"><div class="firm">${h(s.firmName)}</div><div class="tier">${h(D.TIERS[s.tier].name)} · ${h(s.city.name)}</div></div>
       <div class="stat"><span class="label">Date</span><span class="value">${h(date(s.day))}</span></div>
       <div class="stat"><span class="label">Cash</span><span class="value ${s.cash < 0 ? 'danger' : ''}">${M(s.cash, { short: true })}</span>${s.debt ? `<span class="small muted mono">debt ${M(s.debt, { short: true })}</span>` : `<span class="small muted mono">burn ${M(o.total, { short: true })}/mo</span>`}</div>
-      <div class="stat"><span class="label">Reputation</span><span class="value">${Math.round(s.reputation)}</span><div class="repbar"><span style="width:${s.reputation}%"></span></div></div>
+      <div class="stat" title="Street reputation: what clients and referral sources think. Drives lead volume and quality."><span class="label">Street rep</span><span class="value">${Math.round(s.reputation)}</span><div class="repbar"><span style="width:${s.reputation}%"></span></div></div>
+      <div class="stat" title="Carrier reputation: how adjusters reserve against your letterhead. Rises when you file and try cases; falls when you take early lowballs."><span class="label">Carrier rep</span><span class="value">${Math.round(s.carrierRep == null ? 30 : s.carrierRep)}</span><div class="repbar"><span style="width:${s.carrierRep == null ? 30 : s.carrierRep}%;background:var(--info)"></span></div></div>
       <div class="controls">
         ${btn('advance', 'Advance week', { cls: 'primary' })}
         ${btn('toggle-play', PI.Main.playing ? 'Pause' : 'Play')}
@@ -2552,6 +2666,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
         <div class="row"><span class="chip ${days <= 3 ? 'danger' : ''}">${days <= 0 ? 'Leaving today' : `Decides in ${days} day${days === 1 ? '' : 's'}`}</span>${solChip(s, l)}</div></div>
       <p class="narrative">${h(l.clientName.split(' ')[0])} was ${h(l.narrative)} on ${h(date(l.incidentDay))}. Reports ${h(l.injury)}.${l.flags.includes('comp') && l.known.flags.includes('comp') ? ' Was on the job at the time.' : ''}</p>
       <div class="flags">${liab}${ins}${limits}${um}${health}${flagChips(l)}</div>
+      ${(() => { const att = F.leastLoaded(s); const ld = s.loads && s.loads[att.id]; const fee = est.mid * 0.333; const costs = 150 + l.severity * 250 + (T.expertRequired ? 25000 : 0); const hours = 12 + l.severity * 14 + (l.liability.bucket === 'weak' ? 20 : 0); const loadPct = ld ? Math.round(ld.need / ld.cap * 100) : 0; return `<div class="small muted">Economics: fee around <span class="mono">${M(fee, { short: true })}</span> if it settles at value · costs to advance ~<span class="mono">${M(costs, { short: true })}</span> · roughly ${hours} attorney-hours · ${h(att.name)} is at <span class="${loadPct > 100 ? 'danger' : loadPct > 80 ? 'warn' : ''}">${loadPct}% load</span>${l.liability.bucket === 'weak' && l.known.liability ? ' · <span class="danger">weak liability cases rarely settle without suit</span>' : ''}${l.known.limits && l.defendant.limits < est.mid ? ' · <span class="warn">value exceeds policy limits</span>' : ''}</div>`; })()}
       <div class="row between">
         <span class="small muted">Rough value <span class="mono">${M(est.lo, { short: true })} to ${M(est.hi, { short: true })}</span> · ${l.investigated ? 'investigated' : 'based on the intake call only'}</span>
         <div class="actions">
@@ -2581,11 +2696,12 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       <div class="page-head"><h1>Cases</h1><p>Click a file to open it. Delegated files are run by their assigned attorney; hands-on files wait for you.</p></div>
       <div class="row">${filters.map(([id, name, n]) => `<button class="btn sm ${f === id ? 'primary' : ''}" data-act="cases-filter" data-arg="${id}">${name} <span class="cost">${n}</span></button>`).join('')}</div>
       ${rows.length ? `<div class="panel flush table-wrap"><table>
-        <thead><tr><th>Client</th><th>Matter</th><th>Stage</th><th>Attorney</th><th class="num">Est. value</th><th class="num">Offer</th><th>Client</th><th>Deadline</th><th>Status</th></tr></thead>
+        <thead><tr><th>Client</th><th>Matter</th><th>Stage</th><th>Treatment</th><th>Attorney</th><th class="num">Est. value</th><th class="num">Offer</th><th>Client</th><th>Deadline</th><th>Status</th></tr></thead>
         <tbody>${rows.map((c) => { const est = C.estimate(s, c); const closed = !C.isOpen(c); return `<tr class="clickable" data-act="open-case" data-arg="${c.id}">
           <td><strong>${h(c.clientName)}</strong><div class="small muted">${h(SEV_LABEL[c.severity])} · ${closed ? `closed ${h(date(c.closedDay || c.createdDay))}` : `${Math.round((s.day - (c.signedDay || c.createdDay)) / 7)} wks open`}</div></td>
           <td>${h(D.CASE_TYPES[c.type].short)}<div class="small muted">${h(c.injury)}</div></td>
           <td>${stagePill(c)}</td>
+          <td style="min-width:120px">${closed ? `<span class="small muted">${c.settlement && c.settlement.early ? 'Settled pre-MMI' : 'MMI'}</span>` : (() => { const ts = C.treatmentStatus(c); return `<div class="small ${ts.kind}">${h(ts.label)}</div>${meter(ts.pct, ts.kind)}<div class="small muted mono">${M(C.specials(c), { short: true })} billed</div>`; })()}</td>
           <td>${h(attName(s, c.attorneyId))}${c.delegated ? `<div class="small muted">delegated</div>` : ''}</td>
           <td class="num">${closed && c.settlement ? M(c.settlement.gross) : `${M(est.lo, { short: true })}–${M(est.hi, { short: true })}`}</td>
           <td class="num">${c.negotiation && c.negotiation.currentOffer ? M(c.negotiation.currentOffer) : '—'}</td>
@@ -2638,7 +2754,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       ${primary.length ? `<div class="panel" style="border-color:var(--accent)"><div class="row between"><div><h3>Your decision</h3><p class="muted small">${h(primary[0].desc)}</p></div><div class="actions">${primary.map(actBtn).join('')}</div></div></div>` : ''}
       <div class="grid cols-3">
         <div class="panel"><h3>Value</h3>
-          <dl class="kv"><dt>Estimate</dt><dd class="mono">${M(est.lo)} – ${M(est.hi)}</dd><dt>Fee at midpoint</dt><dd class="mono">${M(feeOnEst)} (${Math.round(c.feePct * 100)}%)</dd><dt>Billed medicals</dt><dd class="mono">${M(specials)}${c.treatment.mmi ? '' : ' so far'}</dd><dt>Wage loss</dt><dd class="mono">${M(c.wage)}</dd>${c.futureMeds ? `<dt>Future medicals</dt><dd class="mono">${M(c.futureMeds)}</dd>` : ''}<dt>Costs advanced</dt><dd class="mono">${M(c.costs)}</dd><dt>Collectible</dt><dd class="mono">${c.known.limits ? `${M(c.defendant.limits)}${c.defendant.umbrella ? ` + ${M(c.defendant.umbrella)} umbrella` : ''}` : c.known.uninsured ? 'Uninsured defendant' : 'Limits unknown'}${c.uim ? `<br>UIM claim open (${M(c.client.umLimit)})` : ''}</dd></dl>
+          <dl class="kv"><dt>Estimate</dt><dd class="mono">${M(est.lo)} – ${M(est.hi)}</dd><dt>Fee at midpoint</dt><dd class="mono">${M(feeOnEst)} (${Math.round(c.feePct * 100)}%)</dd>${!c.treatment.mmi && C.isOpen(c) ? `<dt>Worked up fully</dt><dd class="mono" title="A rough read on what the case is worth once treatment is complete">${M(Math.round(C.potentialValue(s, c) * 0.8 / 1000) * 1000, { short: true })} – ${M(Math.round(C.potentialValue(s, c) * 1.2 / 1000) * 1000, { short: true })}</dd>` : ''}<dt>Billed medicals</dt><dd class="mono">${M(specials)}${c.treatment.mmi ? '' : ' so far'}</dd><dt>Wage loss</dt><dd class="mono">${M(c.wage)}</dd>${c.futureMeds ? `<dt>Future medicals</dt><dd class="mono">${M(c.futureMeds)}</dd>` : ''}<dt>Costs advanced</dt><dd class="mono">${M(c.costs)}</dd><dt>Collectible</dt><dd class="mono">${c.known.limits ? `${M(c.defendant.limits)}${c.defendant.umbrella ? ` + ${M(c.defendant.umbrella)} umbrella` : ''}` : c.known.uninsured ? 'Uninsured defendant' : 'Limits unknown'}${c.uim ? `<br>UIM claim open (${M(c.client.umLimit)})` : ''}</dd></dl>
         </div>
         <div class="panel"><h3>Liability</h3>
           <dl class="kv"><dt>Position</dt><dd>${h(liabText)}</dd><dt>Strength</dt><dd>${meter(strength * 100, strength < 0.5 ? 'danger' : strength < 0.75 ? 'warn' : '')}<span class="small muted">${strength > 0.85 ? 'Strong' : strength > 0.65 ? 'Good' : strength > 0.45 ? 'Contested' : 'Weak'}${c.liability.cf && c.known.liability ? ` · ${Math.round(c.liability.cf * 100)}% comparative fault alleged` : ''}</span></dd><dt>Evidence</dt><dd><div class="flags">${evidence}</div></dd><dt>Facts</dt><dd><div class="flags">${flagChips(c) || '<span class="muted small">Nothing notable yet</span>'}</div></dd></dl>
@@ -2652,7 +2768,8 @@ canvas.chart { width: 100%; height: 160px; display: block; }
           <dl class="kv"><dt>Who</dt><dd>${h(c.clientName)}, ${c.clientAge}, ${h(c.occupation)}</dd><dt>Mood</dt><dd>${meter(c.client.mood, moodKind(c.client.mood))}<span class="small muted">${Math.round(c.client.mood)}/100 · last contact ${s.week - c.client.lastContactWeek} wk ago</span></dd><dt>Expectations</dt><dd>${c.client.expectations > 1.2 ? 'Unrealistic' : 'Reasonable'}</dd>${c.satisfaction != null ? `<dt>Satisfaction</dt><dd>${c.satisfaction}/100</dd>` : ''}</dl>
         </div>
         <div class="panel"><h3>Treatment</h3>
-          <div class="small muted" style="margin-bottom:6px">${c.treatment.mmi ? 'Reached maximum medical improvement.' : c.treatment.inGap ? '<span class="warn">Client is not currently treating (gap in care).</span>' : `Active treatment, about ${PI.weeksToText(Math.max(0, Math.round(c.treatment.weeksLeft)))} remaining.`}${c.treatment.gaps ? ` ${c.treatment.gaps} gap${c.treatment.gaps > 1 ? 's' : ''} in care.` : ''}${c.treatment.surgeryIndicated && !c.treatment.surgeryDone && !c.treatment.surgeryDeclined ? ' <span class="brass">Surgery recommended.</span>' : ''}</div>
+          ${(() => { const ts = C.treatmentStatus(c); return `<div class="row between small"><span class="${ts.kind}">${h(ts.label)}</span><span class="muted mono">${ts.pct}%</span></div>${meter(ts.pct, ts.kind)}`; })()}
+          <div class="small muted" style="margin:6px 0">${c.treatment.mmi ? 'Reached maximum medical improvement.' : c.treatment.inGap ? '<span class="warn">Client is not currently treating (gap in care).</span>' : `Active treatment, about ${PI.weeksToText(Math.max(0, Math.round(c.treatment.weeksLeft)))} remaining.`}${c.treatment.gaps ? ` ${c.treatment.gaps} gap${c.treatment.gaps > 1 ? 's' : ''} in care.` : ''}${c.treatment.surgeryIndicated && !c.treatment.surgeryDone && !c.treatment.surgeryDeclined ? ' <span class="brass">Surgery recommended.</span>' : ''}</div>
           <table class="small">${c.treatment.plan.map((p) => `<tr><td>${h(p.name)}</td><td class="num">${p.billed ? M(p.billed) : '—'}</td><td class="small muted">${p.recordsReceived ? 'records in' : p.recordsRequested ? 'records requested' : p.done ? 'complete' : 'treating'}</td></tr>`).join('')}</table>
         </div>
         <div class="panel"><h3>Deadlines</h3>
@@ -2664,7 +2781,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       ${n && n.offers && n.offers.length ? `<div class="panel"><h3>Negotiation</h3><div class="table-wrap"><table class="offer-table"><thead><tr><th>Date</th><th>From</th><th class="num">Amount</th><th>Note</th></tr></thead><tbody>${n.offers.slice().reverse().map((o) => `<tr><td>${h(date(o.day))}</td><td>${o.from === 'firm' ? 'Firm' : o.from === 'defense' ? 'Defense counsel' : h(c.defendant.adjuster || 'Adjuster')}</td><td class="num ${o.from === 'firm' ? '' : 'brass'}">${o.amount ? M(o.amount) : 'No offer'}</td><td class="small muted">${h(o.note || '')}</td></tr>`).join('')}</tbody></table></div>${n.awaiting ? '<p class="small muted" style="margin-top:6px">Waiting on the carrier\'s response.</p>' : ''}</div>` : ''}
       ${c.liens.length ? `<div class="panel"><h3>Liens and reimbursement claims</h3><div class="table-wrap"><table><thead><tr><th>Holder</th><th>Type</th><th class="num">Asserted</th><th class="num">After reduction</th></tr></thead><tbody>${c.liens.map((l) => `<tr><td>${h(l.holder)}</td><td class="small" title="${h(D.LIEN_TYPES[l.type].desc)}">${h(D.LIEN_TYPES[l.type].name)}</td><td class="num">${M(l.amount)}</td><td class="num">${l.reduction != null ? M(l.amount - l.reduction) : '—'}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
       ${statement ? `<div class="panel"><h3>Settlement statement</h3><div class="table-wrap"><table><tr><td>Gross recovery</td><td class="num">${M(statement.gross)}</td></tr><tr><td>Attorney fee (${Math.round(c.feePct * 100)}%)${statement.feeCut ? ` <span class="small muted">reduced by ${M(statement.feeCut)}</span>` : ''}</td><td class="num">-${M(statement.feeNet)}</td></tr><tr><td>Case costs reimbursed</td><td class="num">-${M(statement.costs)}</td></tr><tr><td>Liens paid</td><td class="num">-${M(statement.liens)}</td></tr>${statement.referral ? `<tr><td>Referral fee to referring attorney</td><td class="num">-${M(statement.referral)}</td></tr>` : ''}<tr><th>Net to client</th><th class="num">${M(statement.net)}</th></tr></table></div><p class="small muted" style="margin-top:6px">${st.disbursed ? 'Funds disbursed.' : st.negotiating ? 'Lien negotiations in progress.' : `Settlement funds expected in about ${PI.weeksToText(Math.max(0, st.weeksToCheck))}.`}</p></div>` : ''}
-      ${open ? `<div class="panel"><h3>Actions</h3><div class="actions">${regular.map(actBtn).join('')}</div>${experts.length ? `<details style="margin-top:10px"><summary class="small">Experts (${experts.length} available)</summary><div class="actions" style="margin-top:8px">${experts.map(actBtn).join('')}</div></details>` : ''}<div class="actions" style="margin-top:10px;border-top:1px solid var(--line);padding-top:10px">${manage.map(actBtn).join('')}</div></div>` : ''}
+      ${open ? `<div class="panel"><h3>Actions</h3><div class="actions">${regular.map(actBtn).join('')}</div>${actions.filter((a) => a.group === 'strategy').length ? `<div class="actions" style="margin-top:10px">${actions.filter((a) => a.group === 'strategy').map(actBtn).join('')}<span class="small muted">${h(actions.find((a) => a.group === 'strategy').desc)}</span></div>` : ''}${experts.length ? `<details style="margin-top:10px"><summary class="small">Experts (${experts.length} available)</summary><div class="actions" style="margin-top:8px">${experts.map(actBtn).join('')}</div></details>` : ''}<div class="actions" style="margin-top:10px;border-top:1px solid var(--line);padding-top:10px">${manage.map(actBtn).join('')}</div></div>` : ''}
       <div class="grid cols-2">
         <div class="panel"><h3>File history</h3><div class="timeline">${c.timeline.slice().reverse().map((t) => `<div class="entry ${t.kind}"><span class="when">${h(date(t.day))}</span><span class="what">${h(t.text)}</span></div>`).join('')}</div></div>
         <div class="panel"><h3>Documents</h3>${c.docs.length ? `<div class="timeline">${c.docs.slice().reverse().map((d) => `<div class="entry"><span class="when">${h(date(d.day))}</span><span class="what">${h(d.name)}</span></div>`).join('')}</div>` : '<div class="empty">Nothing in the file yet.</div>'}${c.costLog.length ? `<h4 style="margin-top:12px">Costs advanced</h4><div class="timeline">${c.costLog.slice().reverse().map((x) => `<div class="entry"><span class="when">${h(date(x.day))}</span><span class="what">${h(x.label)} <span class="mono muted">${M(x.amount)}</span></span></div>`).join('')}</div>` : ''}</div>
@@ -2808,6 +2925,17 @@ canvas.chart { width: 100%; height: 160px; display: block; }
         </div>
       </div>
       <div class="grid cols-2">
+        <div class="panel"><h3>How the firm runs</h3><p class="small muted" style="margin-bottom:10px">Sets how delegated attorneys and intake staff behave. Your own hands-on decisions can go either way, file by file.</p>
+          <h4>Case philosophy</h4>
+          <div class="options" style="margin:6px 0 12px">${[['volume', 'Volume shop', 'Demand on the bills to date as soon as liability is settled, take the first fair offer, move on. Fast cash, smaller fees per case, carriers learn you fold, clients who needed more treatment leave reviews.'], ['balanced', 'Balanced', 'Wait for MMI on most files, counter a few rounds, sue when the number is insulting.'], ['value', 'Maximum value', 'Specialists, surgery, full work-up, suit when the offer is short of value, a jury when it has to be. Slow money, bigger money, carriers reserve higher against you, clients refer their families.']].map(([id, name, desc]) => `<button class="btn ${s.strategy.philosophy === id ? 'primary' : ''}" data-act="strategy" data-arg="philosophy" data-arg2="${id}"><span>${name}</span><span class="desc">${desc}</span></button>`).join('')}</div>
+          <h4>Intake selectivity</h4>
+          <div class="options" style="margin:6px 0 0">${[['all', 'Sign everything with coverage', 'Every file consumes attorney hours and advanced costs. Weak cases drag the rest down.'], ['selective', 'Selective', 'Decline the tiny, the weak and the time-bombs; sign the rest.'], ['strong', 'Strong cases only', 'Clear liability, real injuries, no red flags. Fewer files, each one worth working.']].map(([id, name, desc]) => `<button class="btn ${s.strategy.selectivity === id ? 'primary' : ''}" data-act="strategy" data-arg="selectivity" data-arg2="${id}"><span>${name}</span><span class="desc">${desc}</span></button>`).join('')}</div>
+        </div>
+        <div class="panel"><h3>What the carriers think of you</h3><p class="small muted" style="margin-bottom:8px">Carrier reputation ${Math.round(s.carrierRep == null ? 30 : s.carrierRep)}/100. Every adjuster desk keeps a file on your firm: file suit and win verdicts and they pay; fold on lowballs and bluff limits demands and they stop taking you seriously.</p>
+          ${Object.keys(s.carriers || {}).length ? `<div class="table-wrap"><table><thead><tr><th>Carrier</th><th>Attitude</th><th class="num">Closed</th><th class="num">Paid</th><th>Recent</th></tr></thead><tbody>${Object.entries(s.carriers).map(([id, k]) => { const ins = D.INSURERS.find((i) => i.id === id); if (!ins) return ''; const att = k.credibility >= 3 ? ['Respects the firm', 'good'] : k.credibility <= -3 ? ['Lowballs the firm', 'danger'] : ['Neutral', '']; return `<tr><td>${h(ins.name)}</td><td>${chip(att[0], att[1])}</td><td class="num">${k.cases}</td><td class="num">${M(k.paid, { short: true })}</td><td class="small muted">${k.notes.slice(0, 2).map((n) => h(n.why)).join(', ')}</td></tr>`; }).join('')}</tbody></table></div>` : '<div class="empty">No history with any carrier yet.</div>'}
+        </div>
+      </div>
+      <div class="grid cols-2">
         <div class="panel"><h3>Firm policies</h3><div class="stack">
           <label class="row"><input type="checkbox" data-act="policy" data-arg="autoDelegate" ${s.policy.autoDelegate ? 'checked' : ''}> New files assigned to other attorneys are delegated to them</label>
           <label class="row"><input type="checkbox" data-act="policy" data-arg="pauseOnDecision" ${s.policy.pauseOnDecision ? 'checked' : ''}> Pause autoplay when a decision or event needs you</label>
@@ -2844,12 +2972,14 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       const cap = C.collectible(s, c);
       const known = c.known.limits && !c.defendant.uninsured;
       const specials = C.specials(c);
-      const presets = [['Conservative', Math.round(est.mid * 1.3 / 1000) * 1000], ['Standard', Math.round(est.mid * 1.8 / 1000) * 1000], ['Aggressive', Math.round(est.mid * 2.6 / 1000) * 1000]];
+      const read = C.carrierRead(s, c); const readMid = (read.lo + read.hi) / 2;
+      const presets = [['Conservative', Math.round(readMid * 1.4 / 1000) * 1000], ['Standard', Math.round(readMid * 1.9 / 1000) * 1000], ['Aggressive', Math.round(readMid * 2.5 / 1000) * 1000]];
       if (known) presets.push(['Policy limits', c.defendant.limits]);
       const tlOk = known && C.effectiveLiability(c) >= 0.6 && est.mid >= c.defendant.limits * 0.7;
       html = `<h2>Demand: ${h(c.clientName)}</h2>
         <p class="muted">The demand anchors everything that follows. Ask too little and the carrier will happily pay it. Ask absurdly and they stop taking you seriously. ${known ? `Policy limits are <span class="mono">${M(c.defendant.limits)}</span>.` : 'Limits are undisclosed; you are negotiating blind.'}</p>
-        <dl class="kv"><dt>Your valuation</dt><dd class="mono">${M(est.lo)} – ${M(est.hi)}</dd><dt>Billed medicals</dt><dd class="mono">${M(specials)}</dd><dt>Wage loss</dt><dd class="mono">${M(c.wage)}</dd><dt>Liability</dt><dd>${h(c.liability.determination || 'undetermined')}${c.liability.cf ? `, ${Math.round(c.liability.cf * 100)}% comparative fault alleged` : ''}</dd></dl>
+        <dl class="kv"><dt>Your valuation</dt><dd class="mono">${M(est.lo)} – ${M(est.hi)}</dd>${(() => { const r = C.carrierRead(s, c); const att = F.staffById(s, c.attorneyId); return `<dt>Your read on the carrier</dt><dd class="mono">${M(r.lo)} – ${M(r.hi)} <span class="small muted" style="font-family:var(--font-ui)">likely authority, judged by ${h(att ? att.name : 'the attorney')} (negotiation ${att ? att.skills.negotiation : 5}/10)</span></dd>`; })()}<dt>Billed medicals</dt><dd class="mono">${M(specials)}${c.treatment.mmi ? '' : ' <span class="warn" style="font-family:var(--font-ui)">and still treating: the carrier will discount an open injury</span>'}</dd><dt>Wage loss</dt><dd class="mono">${M(c.wage)}</dd><dt>Liability</dt><dd>${h(c.liability.determination || 'undetermined')}${c.liability.cf ? `, ${Math.round(c.liability.cf * 100)}% comparative fault alleged` : ''}</dd></dl>
+        <p class="small muted">A demand around 1.5 to 2.5 times the carrier's likely authority leaves room to negotiate. Past 2.5 times, adjusters open lower and dig in; below it, they close fast and you leave money behind.</p>
         <div class="presets">${presets.map(([n, v]) => `<button class="btn sm" data-act="preset" data-arg="${v}">${n} <span class="cost">${M(v, { short: true })}</span></button>`).join('')}</div>
         <div class="amount-input"><span class="muted">$</span><input type="number" id="demand-amt" value="${presets[1][1]}" step="1000" min="1000"></div>
         ${known ? `<label class="row small"><input type="checkbox" id="demand-tl" ${!tlOk ? 'disabled' : ''}> Time-limited policy-limits demand (30 days). ${tlOk ? 'If the carrier fails to tender its limits in time, it becomes liable for any excess verdict.' : 'Only credible when liability is clear and the case is worth the policy.'}</label>` : ''}
@@ -2866,6 +2996,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       const steps = inLit && c.litigation.stepsOffer;
       html = `<h2>${offer ? `Offer: ${M(offer)}` : 'No offer'} <span class="muted small">· ${h(c.clientName)}</span></h2>
         <p class="muted">${offer ? `${n.finalOffer ? 'The carrier calls this final. ' : ''}${h((n.offers[n.offers.length - 1] || {}).note || '')}` : 'The carrier declined to put a number on the table.'} ${steps ? 'Trial starts Monday if you say no.' : ''}</p>
+        ${(() => { const r = C.carrierRead(s, c); const pct = Math.round(offer / Math.max(1, est.mid) * 100); const lowball = offer < r.lo * 0.75; return `<div class="row small"><span class="chip ${pct >= 85 ? 'good' : pct >= 60 ? 'warn' : 'danger'}">${pct}% of your valuation</span><span class="muted">Your read on their authority: <span class="mono">${M(r.lo)} – ${M(r.hi)}</span>.</span>${lowball && !n.finalOffer ? '<span class="danger">Taking this now tells carriers your firm folds.</span>' : ''}</div>`; })()}
         <div class="grid cols-2"><dl class="kv"><dt>Your valuation</dt><dd class="mono">${M(est.lo)} – ${M(est.hi)}</dd><dt>Round</dt><dd>${n.round}${n.escalated ? ' (escalated)' : ''}</dd><dt>Statute</dt><dd>${c.litigation && c.litigation.filed ? 'Suit on file' : h(PI.daysToText(c.solDay - s.day))}</dd></dl>
         <dl class="kv"><dt>Fee if accepted</dt><dd class="mono">${M(fee)}</dd><dt>Costs reimbursed</dt><dd class="mono">${M(c.costs)}</dd><dt>Liens asserted</dt><dd class="mono">${M(liens)}</dd><dt>Client would net</dt><dd class="mono">about ${M(Math.max(0, offer - fee - c.costs - liens * 0.6))} after lien negotiation</dd></dl></div>
         ${n.offers.length > 1 ? `<div class="table-wrap"><table class="offer-table small">${n.offers.slice(-6).map((o) => `<tr><td>${h(date(o.day))}</td><td>${o.from === 'firm' ? 'You' : 'Carrier'}</td><td class="num">${o.amount ? M(o.amount) : 'no offer'}</td></tr>`).join('')}</table></div>` : ''}
@@ -2901,6 +3032,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     } else if (m.type === 'menu') {
       html = `<h2>Menu</h2>
         <div class="options">
+          <button class="btn primary" data-act="help"><span>How to play and how to win</span><span class="desc">The levers that matter and the trade-offs behind them.</span></button>
           <button class="btn" data-act="save"><span>Save game</span><span class="desc">Saved in this browser. The game also autosaves every week.</span></button>
           <button class="btn" data-act="export"><span>Copy save to clipboard</span><span class="desc">A text blob you can paste into another browser.</span></button>
           <button class="btn" data-act="show-import"><span>Import a save</span><span class="desc">Paste a save blob below.</span></button>
@@ -2909,6 +3041,19 @@ canvas.chart { width: 100%; height: 160px; display: block; }
         <textarea id="import-text" rows="4" placeholder="Paste a save here, then press Import" style="width:100%"></textarea>
         <div class="actions">${btn('import', 'Import')}${btn('close-modal', 'Close')}</div>
         <p class="small muted">Contingency is a simulation. Insurers, courts and cities are fictional. Nothing here is legal advice.</p>`;
+    } else if (m.type === 'help') {
+      html = `<h2>How to play</h2>
+        <div class="stack" style="gap:12px">
+          <p><strong>You get paid at the end.</strong> A third of the recovery pre-suit, forty percent after you file. You advance every cost. Cash is the constraint; the line of credit is the cushion.</p>
+          <p><strong>Not every case is worth signing.</strong> Each file eats attorney hours. An overloaded attorney moves every file slower, clients stop hearing back, deadlines slip and bar complaints follow. Each lead shows the fee it might produce, the costs you will front and the load it adds. Weak liability, uninsured defendants, minimum policies and difficult clients are how firms lose money.</p>
+          <p><strong>Treatment is the case.</strong> Value is built on medical bills and what the doctors say. Watch the treatment column: treating, in a gap, or at maximum medical improvement (MMI). Waiting for MMI, referring to specialists and following a surgery recommendation raise the value. Demanding before MMI gets money in months instead of years, at a steep discount, and the client signs away future care. Some of them come back angry.</p>
+          <p><strong>Evidence changes the carrier's mind.</strong> Police reports, witnesses, video and scene inspections raise liability strength and cut comparative fault, but only if they are in hand before the adjuster decides, or you submit them and ask for a second look. Video gets overwritten within weeks; preservation letters go out first. An investigator on staff does this for free, every week, on every file.</p>
+          <p><strong>Demands have a right size.</strong> Your attorney's read on the carrier's authority gets sharper with negotiation skill. Ask around 1.5 to 2.5 times that read. Ask too little and they pay it. Ask too much and they open low, dig in and stop taking your letters seriously.</p>
+          <p><strong>Two reputations.</strong> Street reputation comes from satisfied clients, referrals, community and advertising; it brings leads. Carrier reputation comes from what you do with offers: fold early and every adjuster in town lowballs you; file suits and win verdicts and they reserve higher against your letterhead before you say a word.</p>
+          <p><strong>Pick a kind of firm.</strong> A volume shop signs widely, settles early and lives on marketing and headcount. A boutique signs strong cases, works them up fully and lives on referrals and verdicts. Both can make money. The Firm tab sets how your delegated attorneys and intake staff behave; your own hands-on files can go either way.</p>
+          <p><strong>The clock.</strong> Every claim has a statute of limitations. Suit must be on file before it runs or the case dies and the client sues you. Government claims need a notice of claim within months.</p>
+        </div>
+        <div class="actions">${btn('close-modal', 'Got it')}</div>`;
     } else if (m.type === 'gameover') {
       html = `<h2>${s.gameOver.kind === 'bankrupt' ? 'The firm is insolvent' : 'The firm has dissolved'}</h2><p>${h(s.gameOver.text)}</p><table><tr><td>Years in practice</td><td class="num">${(s.week / 52).toFixed(1)}</td></tr><tr><td>Lifetime fees</td><td class="num">${M(s.stats.feesEarned)}</td></tr><tr><td>Recovered for clients</td><td class="num">${M(s.stats.recovered)}</td></tr><tr><td>Cases resolved</td><td class="num">${s.stats.resolved}</td></tr><tr><td>Highest tier</td><td>${h(D.TIERS[s.tier].name)}</td></tr></table><div class="actions">${btn('new-game', 'Start a new firm', { cls: 'primary' })}</div>`;
     }
@@ -3006,6 +3151,8 @@ canvas.chart { width: 100%; height: 160px; display: block; }
     'show-event'(arg) { U.modal = { type: 'event', uid: arg }; U.renderModal(); },
     'event-opt'(arg, el) { F.resolveEvent(U.state, arg, parseInt(el.dataset.arg2, 10)); U.modal = null; afterAction(); },
     policy(arg, el) { const s = U.state; s.policy[arg] = el.checked; if (arg === 'autoIntake' && el.checked) F.autoIntake(s); afterAction(); },
+    strategy(arg, el) { U.state.strategy[arg] = el.dataset.arg2; afterAction(); },
+    help() { U.modal = { type: 'help' }; U.renderModal(); },
     // Intake
     'sign-lead'(arg) { const s = U.state; const sel = document.querySelector(`select[data-role="assign-${arg}"]`); const c = F.signLead(s, arg, sel ? sel.value : null); if (c) { U.toast(`${c.clientName} signed. Assigned to ${F.staffById(s, c.attorneyId).name}.`); } afterAction(); },
     'decline-lead'(arg) { F.declineLead(U.state, arg); afterAction(); },
@@ -3070,7 +3217,7 @@ canvas.chart { width: 100%; height: 160px; display: block; }
       U.tab = 'dashboard'; U.caseFilter = 'attention'; U.openCaseId = null; U.modal = null;
       Main.save(true);
       Main.enterGame();
-      U.toast('Welcome to the practice of law. Three files came with you; two have decisions waiting.');
+      U.modal = { type: 'help' }; U.renderModal(); U.toast('Welcome to the practice of law. Three files came with you.');
     }
   };
   function captureNg() { const f = document.getElementById('ng-founder'), fi = document.getElementById('ng-firm'); if (f) U.ng.founderName = f.value; if (fi) U.ng.firmName = fi.value; }

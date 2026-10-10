@@ -70,6 +70,8 @@
     'show-event'(arg) { U.modal = { type: 'event', uid: arg }; U.renderModal(); },
     'event-opt'(arg, el) { F.resolveEvent(U.state, arg, parseInt(el.dataset.arg2, 10)); U.modal = null; afterAction(); },
     policy(arg, el) { const s = U.state; s.policy[arg] = el.checked; if (arg === 'autoIntake' && el.checked) F.autoIntake(s); afterAction(); },
+    strategy(arg, el) { U.state.strategy[arg] = el.dataset.arg2; afterAction(); },
+    help() { U.modal = { type: 'help' }; U.renderModal(); },
     // Intake
     'sign-lead'(arg) { const s = U.state; const sel = document.querySelector(`select[data-role="assign-${arg}"]`); const c = F.signLead(s, arg, sel ? sel.value : null); if (c) { U.toast(`${c.clientName} signed. Assigned to ${F.staffById(s, c.attorneyId).name}.`); } afterAction(); },
     'decline-lead'(arg) { F.declineLead(U.state, arg); afterAction(); },
@@ -134,7 +136,7 @@
       U.tab = 'dashboard'; U.caseFilter = 'attention'; U.openCaseId = null; U.modal = null;
       Main.save(true);
       Main.enterGame();
-      U.toast('Welcome to the practice of law. Three files came with you; two have decisions waiting.');
+      U.modal = { type: 'help' }; U.renderModal(); U.toast('Welcome to the practice of law. Three files came with you.');
     }
   };
   function captureNg() { const f = document.getElementById('ng-founder'), fi = document.getElementById('ng-firm'); if (f) U.ng.founderName = f.value; if (fi) U.ng.firmName = fi.value; }

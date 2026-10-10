@@ -153,6 +153,13 @@
     return m;
   }
   C.specials = (c) => c.treatment.plan.reduce((a, p) => a + p.billed, 0);
+  C.treatmentStatus = function (c) {
+    const t = c.treatment;
+    if (t.mmi) return { label: 'MMI reached', pct: 100, kind: 'good' };
+    if (t.inGap) return { label: `Gap in care (${t.gapWeeks} wk)`, pct: Math.round((1 - t.weeksLeft / Math.max(1, t.weeksTotal)) * 100), kind: 'danger' };
+    const pct = Math.round(PI.clamp(1 - t.weeksLeft / Math.max(1, t.weeksTotal), 0, 0.99) * 100);
+    return { label: `Treating, ~${PI.weeksToText(Math.max(1, Math.round(t.weeksLeft)))} left`, pct, kind: '' };
+  };
   // The true full value of the case if liability were 100%.
   C.trueValue = function (state, c) {
     const S = D.SEVERITY[c.severity];
@@ -170,6 +177,15 @@
     if (c.litigation && c.litigation.imePenalty) v *= 1 - c.litigation.imePenalty;
     if (c.litigation && c.litigation.depoMod) v *= 1 + c.litigation.depoMod;
     return Math.max(1000, v);
+  };
+  // What the case would be worth fully worked up: the yardstick clients eventually measure you against.
+  C.potentialValue = function (state, c) {
+    const S = D.SEVERITY[c.severity];
+    const mult = (S.mult[0] + S.mult[1]) / 2;
+    const specials = Math.max(C.specials(c), c.specialsTarget);
+    let v = (specials * mult + c.wage + c.futureMeds + c.futureWage) * state.city.venue * (D.CASE_TYPES[c.type].biasMult || 1) * flagsValueMult(c) * (1 + c.client.credibility);
+    const cf = c.liability.cf;
+    return Math.max(1000, v * C.effectiveLiability(c) * (cf >= 0.5 ? 0 : 1 - cf));
   };
   C.expectedValue = function (state, c) {
     const L = C.effectiveLiability(c);
@@ -235,6 +251,7 @@
     if (c.stage === 'litigation') decay += 0.4;
     decay *= 1 - 0.7 * ctx.cm;
     if (ctx.speed < 0.6) decay *= 1.6;
+    if (ctx.speed < 0.5 && R.chance(0.012)) { c.client.mood -= 10; c.client.credibility -= 0.02; C.log(state, c, 'Nobody returned the client\'s calls for three weeks and a records deadline was missed. The file is moving, barely.', 'warn'); if (R.chance(0.25)) PI.Firm.barComplaint(state, `${c.clientName} complained that nobody at the firm knows their case.`); }
     if (ctx.speed < 0.5 && c.stage === 'litigation' && R.chance(0.04)) { c.litigation.depoMod = (c.litigation.depoMod || 0) - 0.03; C.log(state, c, 'A discovery deadline slipped because the attorney is overloaded. Defense counsel noticed.', 'warn'); }
     if (weeksSinceContact > 4) c.client.mood -= decay * Math.min(2, (weeksSinceContact - 2) / 4);
     if (ctx.cm > 0.5 && R.chance(0.3 * ctx.cm)) { c.client.lastContactWeek = state.week; c.client.mood = Math.min(100, c.client.mood + 3); }
@@ -294,7 +311,7 @@
             if (p.id === 'surgery' || p.id === 'rehab') {
               // Surgery happens around the middle of treatment.
               if (t.weeksLeft < t.weeksTotal * 0.6) { p.billed = amt; p.done = true; t.surgeryDone = p.id === 'surgery' || t.surgeryDone; C.log(state, c, `${p.name} completed. Billed ${PI.money(amt)}.`); }
-            } else { p.billed = amt; p.done = true; }
+            } else { p.billed = amt; p.done = true; if (['ortho', 'mri', 'pain', 'neuro'].includes(p.id)) C.log(state, c, `Client seen by ${p.name.toLowerCase()}. Billed ${PI.money(amt)}.`); }
           }
         } else {
           p.billed += perWeekBudget * 0.35 / Math.max(1, open.filter((q) => !providers[q.id].once).length) + R.range(def.perWeek[0], def.perWeek[1]) * 0.5;
@@ -340,6 +357,7 @@
       if (!merged[key]) merged[key] = l; else merged[key].amount += l.amount;
     }
     c.liens = Object.values(merged);
+    c.liensBuilt = true;
     if (c.flags.includes('comp')) c.liens.push({ type: 'comp', holder: 'Workers\' compensation carrier', amount: Math.round(C.specials(c) * 0.5 + c.wage * 0.66), status: 'open' });
     if (cl.medpay && c.medpayUsed) c.liens.push({ type: 'medpay', holder: 'Client\'s auto carrier (med-pay)', amount: c.medpayUsed, status: 'open' });
     if (R.chance(0.04)) c.liens.push({ type: 'childsupport', holder: 'State child support enforcement', amount: R.int(2000, 18000), status: 'open' });
@@ -369,7 +387,9 @@
       if (L > 0.8 - style * 0.15 && c.liability.cf < 0.1) det = 'accepted';
       else if (L < 0.45 || (style > 0.7 && L < 0.6)) det = 'denied';
       else det = 'disputed';
+      if ((c.liability.evidence.video || c.liability.evidence.witnesses) && c.liability.cf > 0) { c.liability.cf *= 0.5; }
       c.liability.determination = det;
+      c.liability.evidenceAtDet = Object.keys(c.liability.evidence).length;
       c.known.liability = true;
       const cfText = c.liability.cf > 0 ? ` They assert ${Math.round(c.liability.cf * 100)}% comparative fault on your client.` : '';
       C.log(state, c, det === 'accepted' ? 'Carrier accepted liability.' : det === 'disputed' ? `Carrier disputes liability.${cfText}` : `Carrier denied liability outright.${cfText}`, det === 'accepted' ? 'good' : 'warn');
@@ -430,14 +450,18 @@
   }
 
   // Hidden reserve: what the adjuster is actually authorized to pay right now.
-  C.reserve = function (state, c, inLit) {
+  C.reserve = function (state, c, inLit, ignoreDemand) {
     const ins = D.INSURERS.find((i) => i.id === c.defendant.insurer);
     const adj = D.ADJUSTER_STYLES.find((s) => s.id === c.defendant.adjusterStyle) || D.ADJUSTER_STYLES[1];
     let exp = C.expectedValue(state, c);
     let factor = 1 - ins.style * 0.45 - adj.mod;
     if (inLit) factor = 0.88 - ins.style * 0.12 + (c.litigation.stageIndex || 0) * 0.015;
     factor += (skill(state, c, 'negotiation') - 5) * 0.025;
-    factor += (state.reputation / 100) * 0.08 + Math.min(0.1, state.stats.trialWins * 0.015);
+    // Carriers reserve against the firm's record, not its billboards.
+    factor += (((state.carrierRep == null ? 30 : state.carrierRep) - 40) / 100) * 0.3;
+    const cred = PI.Firm.carrier(state, c.defendant.insurer).credibility;
+    factor += cred * 0.012;
+    if (!c.treatment.mmi) { const prog = PI.clamp(1 - c.treatment.weeksLeft / Math.max(1, c.treatment.weeksTotal), 0, 1); factor *= 0.72 + 0.22 * prog; } // open-ended treatment: the adjuster discounts hard
     if (c.liability.determination === 'denied' && !inLit) factor *= 0.4;
     const ev = c.liability.evidence;
     if (ev.video || ev.witnesses) factor += 0.04;
@@ -445,9 +469,17 @@
     if (c.demand && c.demand.quality) factor += (c.demand.quality - 1) * 0.1;
     let r = exp * PI.clamp(factor, 0.2, 1.1);
     // Demands below the reserve are accepted: an anchor set low is money left behind.
-    if (c.demand && c.demand.amount && c.demand.amount < r) r = c.demand.amount;
+    if (!ignoreDemand && c.demand && c.demand.amount && c.demand.amount < r) r = c.demand.amount;
     const cap = C.collectible(state, c);
     return Math.min(r, cap);
+  };
+
+  // What the attorney thinks the carrier will authorize: a range that narrows with negotiation skill.
+  C.carrierRead = function (state, c) {
+    const r = C.reserve(state, c, c.stage === 'litigation', true);
+    const sk = skill(state, c, 'negotiation');
+    const noise = 0.45 - sk * 0.035;
+    return { lo: Math.round(r * (1 - noise) / 500) * 500, hi: Math.round(r * (1 + noise) / 500) * 500 };
   };
 
   C.sendDemand = function (state, c, amount, timeLimited) {
@@ -460,11 +492,18 @@
     c.demand.quality = 0.9 + skill(state, c, 'negotiation') / 50 + (state.staffCounts && state.staffCounts.paralegal ? 0.05 : 0);
     c.pending = null;
     c.demand.ready = true;
+    const raw = C.reserve(state, c, false, true);
+    c.demand.ratio = amount / Math.max(1, raw);
+    if (c.demand.ratio > 2.5) PI.Firm.carrierNote(state, c.defendant.insurer, -1, 'unreasonable demand');
+    if (timeLimited && C.expectedValue(state, c) < cap * 0.7) { PI.Firm.carrierNote(state, c.defendant.insurer, -2, 'bluffed a policy-limits demand'); state.carrierRep = PI.clamp((state.carrierRep || 30) - 1, 0, 100); }
     c.docs.push({ day: state.day, name: `Demand letter (${PI.money(amount)}${timeLimited ? ', time-limited policy-limits demand' : ''})` });
     C.log(state, c, `Demand sent for ${PI.money(amount)}${timeLimited ? ' as a time-limited policy-limits demand with a 30-day deadline' : ''}.`, 'stage');
     if (amount > C.trueValue(state, c) * 4 && cap > amount) C.log(state, c, 'The demand is far above any realistic valuation. Expect the adjuster to treat it as noise.', 'warn');
     setStage(state, c, 'negotiation');
-    c.negotiation = { round: 0, offers: [], currentOffer: 0, responseWeek: state.week + R.int(2, 4), finalOffer: false, patience: (D.ADJUSTER_STYLES.find((s) => s.id === c.defendant.adjusterStyle) || D.ADJUSTER_STYLES[1]).patience, escalated: false, awaiting: true };
+    const basePatience = (D.ADJUSTER_STYLES.find((s) => s.id === c.defendant.adjusterStyle) || D.ADJUSTER_STYLES[1]).patience;
+    c.negotiation = { round: 0, offers: [], currentOffer: 0, responseWeek: state.week + R.int(2, 4), finalOffer: false, patience: basePatience, escalated: false, awaiting: true };
+    if (c.demand.ratio > 2.5) { c.negotiation.patience += 1; c.negotiation.lowStart = true; C.log(state, c, 'The demand is well above the carrier\'s evaluation. Expect a lower opening offer and more rounds.', 'warn'); }
+    else if (c.demand.ratio < 1.35) { c.negotiation.patience = Math.max(2, basePatience - 1); c.negotiation.quickClose = true; }
     if (timeLimited) c.negotiation.responseWeek = state.week + R.int(3, 5);
   };
 
@@ -518,7 +557,8 @@
       return;
     }
     const progress = Math.min(1, Math.pow(n.round / n.patience, 0.75));
-    let offer = reserve * (0.4 + 0.58 * progress) * R.range(0.95, 1.03);
+    const start = n.lowStart ? 0.3 : n.quickClose ? 0.6 : 0.4;
+    let offer = reserve * (start + (0.98 - start) * progress) * R.range(0.95, 1.03);
     if (n.lastCounter && n.lastCounter <= reserve * 1.08) offer = Math.max(offer, Math.min(n.lastCounter, reserve) * R.range(0.96, 1.0));
     if (n.round >= n.patience) { n.finalOffer = true; offer = Math.max(offer, reserve * R.range(0.96, 1.0)); }
     offer = Math.max(offer, n.currentOffer * 1.01);
@@ -553,6 +593,11 @@
     const n = c.negotiation || {};
     const inLit = c.stage === 'litigation';
     c.pending = null;
+    const raw = C.reserve(state, c, inLit, true);
+    const ratio = amount / Math.max(1, raw);
+    state.stats.acceptRatioSum = (state.stats.acceptRatioSum || 0) + Math.min(1.2, ratio); state.stats.acceptN = (state.stats.acceptN || 0) + 1;
+    if (ratio < 0.72 && !n.finalOffer && !inLit) { PI.Firm.carrierNote(state, c.defendant.insurer, -1, 'took an early lowball'); state.carrierRep = PI.clamp((state.carrierRep || 30) - 0.8, 0, 100); C.log(state, c, 'Accepted well below the carrier\'s authority. Adjusters remember who folds.', 'warn'); }
+    else if (ratio >= 0.95) { state.carrierRep = PI.clamp((state.carrierRep || 30) + 0.25, 0, 100); }
     C.log(state, c, `Settled for ${PI.money(amount)}${inLit ? ' during litigation' : ' pre-suit'}. Release signed; check expected within weeks.`, 'good');
     c.docs.push({ day: state.day, name: 'Settlement agreement and release' });
     startDisbursement(state, c, amount, inLit ? 'settled_lit' : 'settled');
@@ -582,6 +627,8 @@
     if (!c.negotiation) c.negotiation = { round: 0, offers: [], currentOffer: 0, awaiting: false, patience: 4 };
     c.negotiation.awaiting = false;
     C.addCost(state, c, 450, 'Filing fee');
+    state.carrierRep = PI.clamp((state.carrierRep || 30) + 0.6, 0, 100);
+    PI.Firm.carrierNote(state, c.defendant.insurer, 1, 'filed suit');
     c.docs.push({ day: state.day, name: 'Complaint and jury demand' });
     C.log(state, c, `Complaint filed in ${lit.court}, assigned to ${lit.judge}. Fee converts to 40% under the retainer agreement.`, 'stage');
     if (c.stage !== 'litigation') setStage(state, c, 'litigation');
@@ -746,6 +793,7 @@
       C.log(state, c, `Defense verdict. The jury found ${cf > 0 ? 'your client more than 50% at fault' : 'no negligence by the defendant'}. The firm absorbs ${PI.money(c.costs)} in costs.`, 'bad');
       PI.Firm.log(state, `Defense verdict in ${c.clientName}. ${PI.money(c.costs)} in costs written off.`, 'bad');
       PI.Firm.adjustRep(state, -1);
+      state.carrierRep = PI.clamp((state.carrierRep || 30) - 1.5, 0, 100);
       c.client.mood -= 30;
       return C.kill(state, c, 'lost', 'Case lost at trial.', false);
     }
@@ -762,6 +810,8 @@
     C.log(state, c, `Plaintiff's verdict: ${PI.money(gross)}.${collectible < gross ? ` Only ${PI.money(collectible)} is collectible against the available coverage.` : ''}`, 'good');
     PI.Firm.log(state, `Jury verdict of ${PI.money(gross)} for ${c.clientName}.`, 'good');
     PI.Firm.adjustRep(state, gross > 1000000 ? 4 : 2);
+    state.carrierRep = PI.clamp((state.carrierRep || 30) + (gross > 1000000 ? 6 : 4), 0, 100);
+    PI.Firm.carrierNote(state, c.defendant.insurer, 3, 'beat them at trial');
     if (gross > 1000000) PI.Firm.news(state, `Local jury hands down ${PI.money(gross, { short: true })} verdict against ${c.defendant.name}; ${state.firmName} tried the case.`);
     // Appeal risk.
     if (gross > 400000 && R.chance(0.35)) { C.log(state, c, 'Defense filed a notice of appeal. Expect a year or more before the judgment is paid.', 'warn'); advanceLit(state, c, D.LIT_STAGES.findIndex((s) => s.id === 'appeal')); return; }
@@ -778,7 +828,9 @@
       if (uimAdd > 0) C.log(state, c, `UIM carrier paid ${PI.money(uimAdd)} on top of the liability settlement.`, 'good');
     }
     if (c.defendant.uninsured && c.client.umLimit) { gross = Math.min(gross, c.client.umLimit); }
-    c.settlement = { gross: Math.round(gross + uimAdd), how, day: state.day, weeksToCheck: how === 'verdict' ? R.int(4, 10) : R.int(2, 4), liensNegotiated: false, negotiatingWeeks: 0, disbursed: false };
+    if (!c.liensBuilt) buildLiens(state, c);
+    c.settlement = { gross: Math.round(gross + uimAdd), how, day: state.day, weeksToCheck: how === 'verdict' ? R.int(4, 10) : R.int(2, 4), liensNegotiated: false, negotiatingWeeks: 0, disbursed: false, early: !c.treatment.mmi };
+    if (!c.treatment.mmi) { c.treatment.mmi = true; c.treatment.weeksLeft = 0; C.log(state, c, 'Settled before maximum medical improvement. The release covers any future treatment.', 'warn'); }
     if (c.flags.includes('child')) { c.settlement.weeksToCheck += 6; C.log(state, c, 'Minor\'s settlement requires court approval. Petition filed.'); }
     c.negotiation = c.negotiation || {}; c.negotiation.awaiting = false;
     setStage(state, c, 'disbursement');
@@ -861,14 +913,19 @@
     if (st.costs) PI.Firm.earn(state, st.costs, `Case costs reimbursed: ${c.clientName}`, 'costs_recovered');
     if (st.referral) PI.Firm.log(state, `Paid ${PI.money(st.referral)} referral fee on ${c.clientName}.`);
     state.stats.feesEarned += st.feeNet - st.referral;
+    { const k = PI.Firm.carrier(state, c.defendant.insurer); k.cases++; k.paid += st.gross; }
     state.stats.recovered += st.gross;
     state.stats.resolved++;
     state.stats.biggestSettlement = Math.max(state.stats.biggestSettlement, st.gross);
     if (s.how === 'settled') state.stats.settledPreSuit++; else if (s.how === 'settled_lit') state.stats.settledLit++;
-    const exp = C.expectedValue(state, c);
+    const exp = Math.max(C.expectedValue(state, c), s.early ? C.potentialValue(state, c) : 0);
     const ratio = st.net / Math.max(1, exp * 0.5 * c.client.expectations);
-    let sat = PI.clamp(40 + ratio * 35 + (c.client.mood - 50) * 0.5 - (state.day - c.createdDay) / 60, 0, 100);
+    const weeksOpen = (state.day - (c.signedDay || c.createdDay)) / 7;
+    const processed = (1 - (c.speedLast || 1)) * 25; // clients can tell when they are a file number
+    let sat = PI.clamp(40 + ratio * 35 + (c.client.mood - 50) * 0.5 - weeksOpen / 8 + (weeksOpen < 30 && ratio > 1 ? 8 : 0) - processed, 0, 100);
     c.satisfaction = Math.round(sat);
+    state.stats.satSum = (state.stats.satSum || 0) + c.satisfaction; state.stats.satN = (state.stats.satN || 0) + 1;
+    if (s.early && c.severity >= 2 && R.chance(c.severity >= 3 ? 0.5 : 0.25)) { state.scheduledCaseEvents = state.scheduledCaseEvents || []; state.scheduledCaseEvents.push({ week: state.week + R.int(8, 30), caseId: c.id, kind: 'early_regret' }); }
     c.stage = 'closed'; c.closedDay = state.day; c.pending = null;
     C.log(state, c, `Disbursed. Client netted ${PI.money(st.net)}; firm fee ${PI.money(st.feeNet)}${st.feeCut ? ` (fee reduced by ${PI.money(st.feeCut)} so the client nets something)` : ''}. Client satisfaction ${c.satisfaction}/100.`, 'good');
     PI.Firm.log(state, `${c.clientName} closed: ${PI.money(st.gross)} gross, ${PI.money(st.feeNet)} fee.`, 'good');
@@ -906,6 +963,8 @@
     }
     if (open && c.stage !== 'disbursement') a.push({ id: 'call', name: 'Call the client', desc: 'A twenty-minute status call. Keeps the client treating, informed and loyal.', cost: 0 });
     if (c.known.um && c.client.umLimit > 0 && !c.uim && !c.defendant.uninsured && c.client.umLimit > c.defendant.limits && c.known.limits) a.push({ id: 'uim', name: 'Open UIM claim', desc: `Client's ${PI.money(c.client.umLimit)} UIM limits exceed the defendant's ${PI.money(c.defendant.limits)}. The client's own carrier pays the difference.`, cost: 0 });
+    if (['investigation', 'treatment'].includes(c.stage) && c.liability.determination != null && !c.treatment.mmi && C.specials(c) > 0) a.push({ id: 'demand_early', name: 'Demand now, before MMI', desc: 'The volume play: settle on the bills to date. Faster money, smaller case, and the client signs away future treatment. Carriers discount an open-ended injury by about 12%.', cost: 0, group: 'strategy' });
+    if (['treatment', 'records', 'demand', 'negotiation'].includes(c.stage) && ['disputed', 'denied'].includes(c.liability.determination) && !c.liability.reevaluated && Object.keys(c.liability.evidence).length > (c.liability.evidenceAtDet || 0)) a.push({ id: 'reeval', name: 'Submit new evidence to carrier', desc: 'Ask the adjuster to reconsider liability in light of what the investigation turned up. One shot.', cost: 0 });
     if (c.stage === 'demand' && c.demand && c.demand.ready && !c.demand.sent) a.push({ id: 'demand', name: 'Set demand and send', desc: 'Pick the number. Anchors the whole negotiation.', cost: 0, primary: true });
     if (c.stage === 'negotiation' && !c.negotiation.awaiting && c.pending && c.pending.type === 'offer') a.push({ id: 'respond', name: 'Respond to offer', desc: `Current offer: ${PI.money(c.negotiation.currentOffer)}.`, cost: 0, primary: true });
     if (c.stage === 'negotiation' && c.negotiation.round > 0 && !c.negotiation.escalated && !c.negotiation.awaiting) a.push({ id: 'escalate', name: 'Escalate to supervisor', desc: 'Demand a supervisor review and put the carrier on notice of bad faith. One shot per case.', cost: 0 });
@@ -951,8 +1010,10 @@
       case 'spoliation': {
         c.spoliationSent = true;
         c.docs.push({ day: state.day, name: 'Preservation (spoliation) letters' });
-        const chance = c.flags.includes('dashcam') ? 1 : T.cat === 'premises' || c.type === 'trucking' || c.type === 'rideshare' ? 0.55 : 0.3;
-        if (R.chance(chance)) gainEvidence(state, c, 'video', 'Preservation letter'); else C.log(state, c, 'Preservation letters sent. No footage surfaced; the store says its system overwrites every 72 hours.', 'warn');
+        const weeksSince = (state.day - c.incidentDay) / 7;
+        const decay = Math.max(0.1, 1 - Math.max(0, weeksSince - 2) / 10);
+        const chance = c.flags.includes('dashcam') ? 1 : (T.cat === 'premises' || c.type === 'trucking' || c.type === 'rideshare' ? 0.7 : 0.4) * decay;
+        if (R.chance(chance)) gainEvidence(state, c, 'video', 'Preservation letter'); else C.log(state, c, weeksSince > 6 ? 'Preservation letters sent too late. Every camera in the area had already overwritten the footage.' : 'Preservation letters sent. No footage surfaced; the store says its system overwrites every 72 hours.', 'warn');
         if (c.type === 'trucking' && R.chance(0.6)) gainEvidence(state, c, 'blackbox', 'Preservation letter');
         return true;
       }
@@ -972,6 +1033,28 @@
       case 'uim': C.openUIM(state, c); return true;
       case 'demand': if (payload.amount) C.sendDemand(state, c, Math.round(payload.amount), payload.timeLimited); return true;
       case 'escalate': C.escalate(state, c); return true;
+      case 'demand_early': {
+        c.earlyDemand = true;
+        for (const p of c.treatment.plan) if (p.billed > 0) { p.recordsRequested = true; p.recordsReceived = true; C.addCost(state, c, R.int(25, 120), `Records to date from ${p.name}`); }
+        c.records.started = true; c.records.complete = true;
+        c.demand = { drafted: 0, draftNeed: 2 + Math.floor(c.severity / 2), sent: false };
+        C.log(state, c, 'Decided to demand on the bills to date rather than wait for maximum medical improvement.', 'stage');
+        setStage(state, c, 'demand');
+        return true;
+      }
+      case 'reeval': {
+        c.liability.reevaluated = true;
+        const L = C.effectiveLiability(c);
+        const style = D.INSURERS.find((i) => i.id === c.defendant.insurer).style;
+        const before = c.liability.determination;
+        if ((c.liability.evidence.video || c.liability.evidence.witnesses) && c.liability.cf > 0) c.liability.cf *= 0.5;
+        let det;
+        if (L > 0.78 - style * 0.15 && c.liability.cf < 0.1) det = 'accepted'; else if (L < 0.45) det = 'denied'; else det = 'disputed';
+        c.liability.determination = det;
+        c.liability.evidenceAtDet = Object.keys(c.liability.evidence).length;
+        C.log(state, c, det === before ? `Carrier reviewed the new evidence and kept its position (${det}).` : `Carrier revised its liability position from ${before} to ${det}.`, det === before ? 'warn' : 'good');
+        return true;
+      }
       case 'file': return C.fileSuit(state, c);
       case 'reopen': c.negotiation.awaiting = true; c.negotiation.responseWeek = state.week + R.int(2, 4); if (payload.amount) { c.negotiation.lastCounter = payload.amount; c.negotiation.offers.push({ day: state.day, from: 'firm', amount: payload.amount }); } C.log(state, c, `Renewed demand sent to defense counsel${payload.amount ? ` at ${PI.money(payload.amount)}` : ''}.`); return true;
       case 'accept': {
@@ -1001,6 +1084,12 @@
     const neg = att ? att.skills.negotiation : 5;
     const lit = att ? att.skills.litigation : 5;
     const T = D.CASE_TYPES[c.type];
+    const phil = (state.strategy && state.strategy.philosophy) || 'balanced';
+    const acceptMult = phil === 'volume' ? 0.72 : phil === 'value' ? 0.97 : 0.85;
+    // Volume shops demand on the bills to date as soon as liability is settled.
+    if (phil === 'volume' && ['investigation', 'treatment'].includes(c.stage) && c.liability.determination && c.liability.determination !== 'denied' && !c.treatment.mmi && C.specials(c) > 2000 && c.weeksInStage >= 3) { C.act(state, c, 'demand_early'); return; }
+    if (phil === 'value' && ['investigation', 'treatment'].includes(c.stage)) { const acts0 = C.actions(state, c); if (acts0.find((x) => x.id === 'refer_specialist') && c.liability.determination !== 'denied') C.act(state, c, 'refer_specialist'); if (acts0.find((x) => x.id === 'investigator')) C.act(state, c, 'investigator'); if (acts0.find((x) => x.id === 'scene')) C.act(state, c, 'scene'); }
+    if (C.actions(state, c).find((x) => x.id === 'reeval')) C.act(state, c, 'reeval');
     // Routine investigation tasks happen automatically.
     if (['investigation', 'treatment'].includes(c.stage)) {
       const acts = C.actions(state, c).filter((x) => ['notice', 'police', 'photos', 'spoliation', 'limits', 'um', 'health', 'medpay', 'uim'].includes(x.id) || (x.id === 'investigator' && c.severity >= 2) || (x.id === 'scene' && T.cat === 'premises'));
@@ -1026,7 +1115,7 @@
       const cap = C.collectible(state, c);
       const load = state.loads && state.loads[c.attorneyId] ? state.loads[c.attorneyId] : { speed: 1 };
       const busy = load.speed < 0.75;
-      const target = Math.min(cap, exp * (0.62 + neg * 0.03) * (busy ? 0.85 : 1));
+      const target = Math.min(cap, exp * (0.62 + neg * 0.03) * (busy ? 0.85 : 1) * acceptMult);
       const offer = n.currentOffer;
       const solWeeks = (c.solDay - state.day) / 7;
       const inLit = c.stage === 'litigation';
@@ -1034,13 +1123,14 @@
       else if (inLit) {
         const steps = c.litigation.stageIndex >= 8;
         if (offer > 0 && c.litigation.stageIndex >= 7 && offer >= target * 0.7 && lit < 7) C.act(state, c, 'accept');
-        else if (steps && offer >= target * 0.6 && (lit < 8 || R.chance(0.6))) C.act(state, c, 'accept');
+        else if (steps && offer >= target * (phil === 'value' ? 0.75 : 0.6) && (lit < 8 || R.chance(phil === 'value' ? 0.35 : 0.7))) C.act(state, c, 'accept');
         else C.act(state, c, 'reject');
       }
       else if (n.finalOffer || n.round >= n.patience + 1 || solWeeks < 10) {
         const needExpert = T.expertRequired && !(c.litigation && c.litigation.experts.some((e) => D.EXPERTS[e].required));
         if (needExpert && state.cash > 40000) { const req = Object.keys(D.EXPERTS).find((k) => D.EXPERTS[k].required && D.EXPERTS[k].types.includes(c.type)); C.retainExpert(state, c, req); }
-        const worthSuing = exp > (busy ? 60000 : 20000) && offer < target * 0.75 && state.cash > 5000 && !(T.expertRequired && !(c.litigation && c.litigation.experts.some((e) => D.EXPERTS[e].required)));
+        const sueFloor = phil === 'volume' ? 0.45 : phil === 'value' ? 0.9 : 0.75;
+        const worthSuing = exp > (busy ? 60000 : phil === 'volume' ? 50000 : 20000) && offer < target * sueFloor && state.cash > 5000 && !(T.expertRequired && !(c.litigation && c.litigation.experts.some((e) => D.EXPERTS[e].required)));
         if (worthSuing) { if (!C.fileSuit(state, c)) C.act(state, c, 'accept'); }
         else if (offer > 0) C.act(state, c, 'accept'); else if (solWeeks < 10) C.kill(state, c, 'dropped', 'Associate withdrew: no offer, no viable suit before the statute ran.');
         else C.act(state, c, 'counter', { amount: Math.round(Math.max(target * 1.3, offer * 1.4) / 500) * 500 });
