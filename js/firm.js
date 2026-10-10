@@ -30,7 +30,7 @@
     const bg = D.FOUNDER_BACKGROUNDS.find((b) => b.id === opts.backgroundId) || D.FOUNDER_BACKGROUNDS[0];
     const state = {
       version: F.SAVE_VERSION, seed: opts.seed, firmName: opts.firmName || 'Law Office of ' + opts.founderName, founderName: opts.founderName, city, cityId: city.id,
-      day: 0, week: 0, cash: bg.cash, debt: 0, creditLimit: 60000, reputation: 18, carrierRep: 30, carriers: {}, strategy: { philosophy: 'balanced', selectivity: 'selective' }, generation: 1, founderDraw: 3500,
+      day: 0, week: 0, cash: bg.cash, debt: 0, creditLimit: 60000, reputation: 18, carrierRep: 30, reviews: { sum: 0, n: 0, recent: [] }, carriers: {}, strategy: { philosophy: 'balanced', selectivity: 'selective' }, generation: 1, founderDraw: 3500,
       office: 0, offices: [], staff: [], candidates: [], cases: [], leads: [], marketing: {}, channelSince: {},
       policy: { autoDelegate: true, autoAssign: true, insured: true, pauseOnDecision: true, autoIntake: false },
       stats: { feesEarned: 0, recovered: 0, resolved: 0, signed: 0, declined: 0, trials: 0, trialWins: 0, trialLosses: 0, biggestVerdict: 0, biggestSettlement: 0, settledPreSuit: 0, settledLit: 0, clientsLost: 0, malpractice: 0, barComplaints: 0, leadsLost: 0, leadsTotal: 0 },
@@ -83,6 +83,11 @@
 
   // ---------- Helpers ----------
   F.founder = (state) => state.staff.find((s) => s.isFounder);
+  // Online reviews. Until a firm has a few, callers assume about four stars.
+  F.stars = function (state) { const r = state.reviews || { sum: 0, n: 0 }; return r.n >= 3 ? r.sum / r.n : 4.0; };
+  F.addReview = function (state, stars, who, why) { state.reviews = state.reviews || { sum: 0, n: 0, recent: [] }; state.reviews.sum += stars; state.reviews.n++; state.reviews.recent.unshift({ day: state.day, stars, who, why }); if (state.reviews.recent.length > 10) state.reviews.recent.pop(); };
+  // How much of every marketing dollar actually turns into a phone call, given the reviews.
+  F.marketingEffect = function (state) { return PI.clamp(0.15 + 0.85 * ((F.stars(state) - 1) / 3), 0.15, 1.15); };
   // Each carrier keeps a file on the firm.
   F.carrier = function (state, id) { state.carriers = state.carriers || {}; return state.carriers[id] || (state.carriers[id] = { credibility: 0, cases: 0, paid: 0, filed: 0, notes: [] }); };
   F.carrierNote = function (state, id, delta, why) { const k = F.carrier(state, id); k.credibility = PI.clamp(k.credibility + delta, -10, 10); k.notes.unshift({ day: state.day, delta, why }); if (k.notes.length > 8) k.notes.pop(); };
@@ -240,7 +245,8 @@
     const mk = state.staff.find((s) => s.role === 'marketing');
     if (mk) perMonth *= 1 + mk.skills.marketing * 0.03;
     perMonth *= state.city.leadBase * (1 + state.offices.length * 0.45);
-    perMonth *= 0.7 + state.reputation / 100 * 0.6;
+    perMonth *= 0.8 + state.reputation / 100 * 0.4;
+    perMonth *= F.marketingEffect(state); // one-star firms pay for ads nobody answers
     if (state.modifiers.leadMultUntil && state.day < state.modifiers.leadMultUntil) perMonth *= state.modifiers.leadMult || 1;
     return perMonth / 4.33;
   };
@@ -714,7 +720,7 @@
     if (state.scheduledCaseEvents) for (const e of state.scheduledCaseEvents.slice()) if (state.week >= e.week) {
       state.scheduledCaseEvents.splice(state.scheduledCaseEvents.indexOf(e), 1);
       const c = state.cases.find((x) => x.id === e.caseId);
-      if (c && e.kind === 'early_regret') { F.log(state, `${c.clientName} needed ${c.severity >= 3 ? 'surgery' : 'months more treatment'} after the early settlement and has no way to pay for it. A one-star review followed.`, 'bad'); F.adjustRep(state, c.severity >= 3 ? -3 : -1.5); if (c.severity >= 3 && R.chance(0.2)) F.barComplaint(state, `${c.clientName} says the firm pushed a quick settlement.`); }
+      if (c && e.kind === 'early_regret') { F.addReview(state, 1, c.clientName, 'pushed into an early settlement'); F.log(state, `${c.clientName} needed ${c.severity >= 3 ? 'surgery' : 'months more treatment'} after the early settlement and has no way to pay for it. A one-star review followed.`, 'bad'); F.adjustRep(state, c.severity >= 3 ? -3 : -1.5); if (c.severity >= 3 && R.chance(0.2)) F.barComplaint(state, `${c.clientName} says the firm pushed a quick settlement.`); }
     }
     if (state.modifiers.massTortDue && state.day >= state.modifiers.massTortDue) { const pay = Math.round(150000 * state.modifiers.massTortMult); F.earn(state, pay, 'Mass tort common benefit fee', 'fees'); state.stats.feesEarned += pay; F.log(state, `The MDL settled globally. Your committee share: ${PI.money(pay)}.`, pay > 150000 ? 'good' : 'bad'); delete state.modifiers.massTortDue; }
     if (state.modifiers.tortReformUntil && state.day > state.modifiers.tortReformUntil) { delete state.modifiers.tortReformUntil; state.city = D.CITIES.find((c) => c.id === state.cityId); F.log(state, 'The damages cap was struck down by the state supreme court.', 'good'); }
@@ -731,6 +737,7 @@
     s.city = D.CITIES.find((c) => c.id === s.cityId) || s.city;
     if (s.modifiers && s.modifiers.tortReformUntil) s.city = Object.assign({}, s.city, { venue: s.city.venue * 0.85 });
     if (s.carrierRep == null) s.carrierRep = 30;
+    s.reviews = s.reviews || { sum: 0, n: 0, recent: [] };
     s.carriers = s.carriers || {};
     s.strategy = s.strategy || { philosophy: 'balanced', selectivity: 'selective' };
     F.recount(s);

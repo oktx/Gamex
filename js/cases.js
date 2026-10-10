@@ -115,7 +115,7 @@
     const credibility = flags.reduce((a, f) => { const x = D.RED_FLAGS.find((r) => r.id === f) || D.GREEN_FLAGS.find((g) => g.id === f); return a + ((x && x.credibility) || 0); }, 0);
 
     const c = {
-      id: PI.uid('case'), createdDay: state.day, expiresDay: state.day + R.int(5, 14), channel: channelId,
+      id: PI.uid('case'), createdDay: state.day, expiresDay: state.day + Math.max(2, Math.round(R.int(5, 14) * (0.4 + 0.6 * (PI.Firm.stars(state) - 1) / 3))), channel: channelId,
       clientName: personName(), clientAge: age, occupation: R.pick(['warehouse worker', 'nurse', 'teacher', 'retiree', 'software developer', 'line cook', 'electrician', 'student', 'rideshare driver', 'accountant', 'landscaper', 'dental hygienist', 'truck driver', 'real estate agent', 'home health aide', 'barber']),
       type, severity: sev, injury: R.pick(S.examples), narrative, incidentDay, solDay: incidentDay + T.sol, noticeDay: T.noticeDays ? incidentDay + T.noticeDays : null, noticeServed: false,
       stage: 'lead', weeksInStage: 0, substage: null, attorneyId: null, delegated: false,
@@ -288,7 +288,7 @@
     c.stage = stage; c.pending = null; c.closedDay = state.day;
     PI.Firm.log(state, `${c.clientName}: ${reason}`, 'bad');
     if (malpractice) PI.Firm.malpractice(state, c);
-    if (fired) { state.stats.clientsLost++; PI.Firm.adjustRep(state, -1.5); state.pendingLiens = state.pendingLiens || []; state.pendingLiens.push({ caseId: c.id, due: state.day + R.int(200, 700), amount: Math.round(C.expectedValue(state, c) * 0.1 * R.range(0.2, 0.8)), name: c.clientName }); }
+    if (fired) { state.stats.clientsLost++; PI.Firm.adjustRep(state, -1.5); if (R.chance(0.6)) PI.Firm.addReview(state, 1, c.clientName, 'nobody returned my calls'); state.pendingLiens = state.pendingLiens || []; state.pendingLiens.push({ caseId: c.id, due: state.day + R.int(200, 700), amount: Math.round(C.expectedValue(state, c) * 0.1 * R.range(0.2, 0.8)), name: c.clientName }); }
   };
 
   function progressTreatment(state, c, ctx) {
@@ -930,6 +930,7 @@
     C.log(state, c, `Disbursed. Client netted ${PI.money(st.net)}; firm fee ${PI.money(st.feeNet)}${st.feeCut ? ` (fee reduced by ${PI.money(st.feeCut)} so the client nets something)` : ''}. Client satisfaction ${c.satisfaction}/100.`, 'good');
     PI.Firm.log(state, `${c.clientName} closed: ${PI.money(st.gross)} gross, ${PI.money(st.feeNet)} fee.`, 'good');
     if (sat > 75) { state.referralCredits = (state.referralCredits || 0) + (sat > 90 ? 2 : 1); PI.Firm.adjustRep(state, 0.4); }
+    { const chance = sat > 80 ? 0.4 : sat < 35 ? 0.55 : 0.12; if (R.chance(chance)) { const stars = sat > 85 ? 5 : sat > 65 ? 4 : sat > 50 ? 3 : sat > 30 ? 2 : 1; PI.Firm.addReview(state, stars, c.clientName, stars >= 4 ? 'happy with the result' : stars === 3 ? 'took too long' : 'felt like a file number'); } }
     if (sat < 35) { PI.Firm.adjustRep(state, -0.8); if (R.chance(0.15)) PI.Firm.barComplaint(state, `${c.clientName} filed a bar complaint over the fee and communication.`); }
     const att = PI.Firm.staffById(state, c.attorneyId);
     if (att) { att.resolved = (att.resolved || 0) + 1; att.feesGenerated = (att.feesGenerated || 0) + st.feeNet; if (R.chance(0.3)) PI.Firm.gainSkill(state, att, s.how === 'verdict' ? 'litigation' : 'negotiation'); }
